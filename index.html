@@ -792,12 +792,17 @@ async function openCardSheet(id, lang) {
       <a class="btn ghost cm-link" target="_blank" rel="noopener" href="${cmUrl(c.name)}">Karte auf Cardmarket (DE/EN, Near Mint)</a>
     </div>
     <fieldset class="add"><legend>Merkliste</legend>
-      <div class="fields"><label style="grid-column:1/-1">Sprache der Karte<select id="w-lang">${Object.entries(LANGS).map(([k, v]) => `<option value="${k}"${k === defLang ? " selected" : ""}>${esc(v)}</option>`).join("")}</select></label></div>
+      <div class="fields"><label style="grid-column:1/-1">Sprache der Karte<select id="w-lang">${Object.entries(LANGS).map(([k, v]) => `<option value="${k}"${k === defLang ? " selected" : ""}>${esc(v)}</option>`).join("")}</select></label>
+        <label style="grid-column:1/-1">Dein Preis, Near Mint (optional, €)<input id="w-own" type="text" inputmode="decimal" placeholder="leer = Cardmarket-ab-Preis"></label></div>
       <button class="btn ghost" id="save"></button>
     </fieldset>`);
   upgradeCmLink(c.id, null);
-  const saveLabel = () => { const cl = $("w-lang").value; $("save").textContent = isSaved(cl) ? `${LANGS[cl]}e Version von Merkliste entfernen` : `${LANGS[cl]}e Version merken`; };
-  $("w-lang").addEventListener("input", saveLabel); saveLabel();
+  const ownVal = () => num(parseFloat(($("w-own").value || $("f-price")?.value || "").replace(/\./g, "").replace(",", ".")));
+  const saveLabel = () => {
+    const cl = $("w-lang").value;
+    $("save").textContent = isSaved(cl) ? (ownVal() ? `Preis der ${LANGS[cl]}en Version für heute speichern` : `${LANGS[cl]}e Version von Merkliste entfernen`) : `${LANGS[cl]}e Version merken`;
+  };
+  ["w-lang", "w-own", "f-price"].forEach(id => $(id)?.addEventListener("input", saveLabel)); saveLabel();
   wireForm(cm);
   $("add").onclick = () => {
     const v = readForm();
@@ -808,11 +813,24 @@ async function openCardSheet(id, lang) {
     toast(`${v.qty}× ${c.name} zur Sammlung hinzugefügt`);
   };
   $("save").onclick = () => {
-    const cl = $("w-lang").value, saved = isSaved(cl);
-    if (saved) watch = watch.filter(w => !(w.id === c.id && (w.cardLang || w.lang) === cl));
-    else { const w = { id: c.id, lang, cardLang: cl, name: c.name, image: c.image, localId: c.localId, set: c.set?.name, addedAt: today(), history: [] }; recordPoint(w, cm); watch.push(w); }
+    const cl = $("w-lang").value, own = ownVal();
+    let w = watch.find(x => x.id === c.id && (x.cardLang || x.lang) === cl);
+    let msg;
+    if (w && !own) { watch = watch.filter(x => x !== w); msg = "Von Merkliste entfernt"; }
+    else {
+      if (!w) { w = { id: c.id, lang, cardLang: cl, name: c.name, image: c.image, localId: c.localId, set: c.set?.name, addedAt: today(), history: [] }; recordPoint(w, cm); watch.push(w); msg = `${LANGS[cl]}e Version gemerkt`; }
+      else msg = "Preis gespeichert";
+      if (own) {
+        // eigener Preis als Messpunkt für heute, hat Vorrang vor dem ab-Preis
+        const d = today(); let pt = w.history[w.history.length - 1];
+        if (!pt || pt.d !== d) { pt = { d }; w.history.push(pt); }
+        pt.own = own; pt.p = own;
+        if (!w.addedAt) w.addedAt = d;
+        msg += ` mit ${eur(own)}`;
+      }
+    }
     store.set("watch", watch); closeSheet();
-    toast(saved ? "Von Merkliste entfernt" : `${LANGS[cl]}e Version gemerkt. Der Preis wird ab heute verfolgt.`);
+    toast(msg);
     if (state.view === "watch") renderWatch();
   };
 }
