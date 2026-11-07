@@ -212,6 +212,21 @@ function cmUrl(name, cardLang) {
   return `https://www.cardmarket.com/de/Pokemon/Products/Search?category=-1&searchString=${encodeURIComponent(name)}&language=${l}&minCondition=2`;
 }
 
+// Cardmarket-Adressen nutzen den englischen Setnamen als Pfad, z. B. /Singles/30th-Celebration
+const cmSlug = (t) => String(t || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/['’]/g, "").replace(/[^A-Za-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+async function cmSetUrl(id, cardLang) {
+  const en = await getCard(id, "en");
+  if (!en?.set?.name || !en.name) return null;
+  const l = CM_LANG[cardLang] ? String(CM_LANG[cardLang]) : "1,3";
+  return `https://www.cardmarket.com/de/Pokemon/Products/Singles/${cmSlug(en.set.name)}?searchString=${encodeURIComponent(en.name)}&language=${l}&minCondition=2`;
+}
+// Ersetzt im Sheet den Link der Namenssuche durch die Setseite, sobald der englische Setname geladen ist
+async function upgradeCmLink(id, cardLang) {
+  const a = document.querySelector("#sheet a.cm-link"); if (!a) return;
+  const u = await cmSetUrl(id, cardLang);
+  if (u && document.contains(a)) a.href = u;
+}
+
 async function getCard(id, lang) {
   const key = lang + ":" + id;
   if (cache.has(key)) return cache.get(key);
@@ -562,11 +577,12 @@ function openWatchSheet(i) {
     </fieldset>
     <div class="actions">
       <button class="btn ghost" id="w-card">Kartendetails und Sammlung</button>
-      <a class="btn ghost" target="_blank" rel="noopener" href="${esc(w.cmLink || cmUrl(w.name, w.cardLang || w.lang))}">${w.cmLink ? "Karte auf Cardmarket öffnen" : `Angebote auf Cardmarket (${esc(LANGS[w.cardLang || w.lang])}, Near Mint)`}</a>
+      <a class="btn ghost${w.cmLink ? "" : " cm-link"}" target="_blank" rel="noopener" href="${esc(w.cmLink || cmUrl(w.name, w.cardLang || w.lang))}">${w.cmLink ? "Karte auf Cardmarket öffnen" : `Angebote auf Cardmarket (${esc(LANGS[w.cardLang || w.lang])}, Near Mint)`}</a>
       <button class="btn danger" id="w-del">Von Merkliste entfernen</button>
     </div>`);
   wireChart($("sheet"), h);
   $("w-card").onclick = () => openCardSheet(w.id, w.lang);
+  if (!w.cmLink) upgradeCmLink(w.id, w.cardLang || w.lang);
   $("w-own-save").onclick = () => {
     const v = num(parseFloat(($("w-own").value || "").replace(/\./g, "").replace(",", ".")));
     w.history = w.history || [];
@@ -773,12 +789,13 @@ async function openCardSheet(id, lang) {
       <button class="btn" id="add">Zur Sammlung hinzufügen</button>
     </fieldset>
     <div class="actions">
-      <a class="btn ghost" target="_blank" rel="noopener" href="${cmUrl(c.name)}">Angebote auf Cardmarket (DE/EN, Near Mint)</a>
+      <a class="btn ghost cm-link" target="_blank" rel="noopener" href="${cmUrl(c.name)}">Karte auf Cardmarket (DE/EN, Near Mint)</a>
     </div>
     <fieldset class="add"><legend>Merkliste</legend>
       <div class="fields"><label style="grid-column:1/-1">Sprache der Karte<select id="w-lang">${Object.entries(LANGS).map(([k, v]) => `<option value="${k}"${k === defLang ? " selected" : ""}>${esc(v)}</option>`).join("")}</select></label></div>
       <button class="btn ghost" id="save"></button>
     </fieldset>`);
+  upgradeCmLink(c.id, null);
   const saveLabel = () => { const cl = $("w-lang").value; $("save").textContent = isSaved(cl) ? `${LANGS[cl]}e Version von Merkliste entfernen` : `${LANGS[cl]}e Version merken`; };
   $("w-lang").addEventListener("input", saveLabel); saveLabel();
   wireForm(cm);
