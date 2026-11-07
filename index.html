@@ -1,0 +1,692 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Kartenpreise</title>
+<meta name="theme-color" content="#14213d">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Kartenpreise">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="icon-180.png">
+<link rel="icon" href="icon-192.png">
+<style>
+/* Layout: sticky header, content, iOS-style bottom tab bar, bottom sheet for details */
+:root {
+  --bg: #f3f5f9; --surface: #ffffff; --fg: #121826; --muted: #5b6475;
+  --line: #dde2ea; --accent: #2a5bd7; --accent-fg: #ffffff; --price: #0f7a4a;
+  --head: #14213d; --head-fg: #ffffff; --chip: #e7ecf6; --bar: #2a5bd7; --danger: #b42318; --up: #c2410c; --down: #0f7a4a;
+  --font: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, sans-serif;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0d1117; --surface: #161c26; --fg: #e8ecf3; --muted: #9aa4b5;
+    --line: #273042; --accent: #6d95ff; --accent-fg: #0d1117; --price: #45d08f;
+    --head: #0a1530; --head-fg: #ffffff; --chip: #1f2838; --bar: #6d95ff; --danger: #ff8a7a; --up: #ff9a5c; --down: #45d08f; color-scheme: dark;
+  }
+}
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+html, body { margin: 0; }
+body { background: var(--bg); color: var(--fg); font: 15px/1.4 var(--font); -webkit-tap-highlight-color: transparent; }
+body::before { content: ""; position: fixed; inset: 0 0 auto; height: env(safe-area-inset-top, 0px); background: var(--head); z-index: 20; }
+header {
+  position: sticky; top: 0; z-index: 10; background: var(--head); color: var(--head-fg);
+  padding: calc(env(safe-area-inset-top, 0px) + 12px) max(16px, env(safe-area-inset-right, 0px)) 12px max(16px, env(safe-area-inset-left, 0px));
+  display: grid; gap: 10px;
+}
+h1 { font-size: 20px; margin: 0; letter-spacing: .2px; }
+form.search { display: flex; gap: 8px; }
+input, select { font: 16px var(--font); }
+input[type=search] { flex: 1; min-width: 0; padding: 10px 12px; border-radius: 10px; border: 0; background: #fff; color: #121826; }
+.btn { border: 0; border-radius: 10px; background: var(--accent); color: var(--accent-fg); font: 600 15px var(--font); padding: 11px 14px; cursor: pointer; }
+.lang { display: flex; gap: 6px; align-items: center; font-size: 13px; opacity: .9; }
+.lang button { border: 1px solid rgba(255,255,255,.35); background: transparent; color: var(--head-fg); border-radius: 999px; padding: 3px 10px; font: 600 12px var(--font); }
+.lang button[aria-pressed="true"] { background: var(--head-fg); color: var(--head); border-color: var(--head-fg); }
+main { padding: 14px max(16px, env(safe-area-inset-right, 0px)) calc(84px + env(safe-area-inset-bottom, 0px)) max(16px, env(safe-area-inset-left, 0px)); max-width: 1100px; margin: 0 auto; }
+.status { color: var(--muted); font-size: 14px; margin: 4px 0 12px; }
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 12px; }
+.card { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; overflow: hidden; display: flex; flex-direction: column; text-align: left; padding: 0; color: inherit; font: inherit; cursor: pointer; }
+.card img { width: 100%; aspect-ratio: 245/342; object-fit: cover; background: var(--chip); display: block; }
+.card .info { padding: 8px 10px 10px; display: grid; gap: 2px; min-width: 0; }
+.card .name { font-weight: 650; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.card .set { color: var(--muted); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.card .price { color: var(--price); font-weight: 700; font-variant-numeric: tabular-nums; margin-top: 2px; }
+.card .price small { color: var(--muted); font-weight: 500; }
+.empty { text-align: center; color: var(--muted); padding: 40px 10px; }
+
+/* Bottom tab bar */
+nav.tabbar {
+  position: fixed; left: 0; right: 0; bottom: 0; z-index: 15; background: var(--surface); border-top: 1px solid var(--line);
+  display: grid; grid-template-columns: repeat(3, 1fr);
+  padding: 6px max(8px, env(safe-area-inset-right, 0px)) calc(6px + env(safe-area-inset-bottom, 0px)) max(8px, env(safe-area-inset-left, 0px));
+}
+nav.tabbar button { border: 0; background: none; color: var(--muted); font: 600 11px var(--font); display: grid; justify-items: center; gap: 2px; padding: 4px 0; cursor: pointer; }
+nav.tabbar svg { width: 24px; height: 24px; }
+nav.tabbar button[aria-pressed="true"] { color: var(--accent); }
+
+/* Dashboard */
+.dash { display: grid; gap: 12px; margin-bottom: 18px; }
+.panel { background: var(--surface); border: 1px solid var(--line); border-radius: 14px; padding: 14px; min-width: 0; }
+.hero .label, .tile .label, .panel h3 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0 0 4px; font-weight: 650; }
+.hero .value { font-size: 34px; font-weight: 750; font-variant-numeric: tabular-nums; letter-spacing: -.5px; }
+.hero .sub { color: var(--muted); font-size: 13px; }
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; }
+.tile .value { font-size: 20px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.tile .sub { color: var(--muted); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.two { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; }
+.bars { display: grid; gap: 8px; }
+.barrow { display: grid; grid-template-columns: 92px 1fr auto; gap: 8px; align-items: center; font-size: 13px; }
+.barrow .track { height: 10px; border-radius: 0 4px 4px 0; background: var(--chip); overflow: hidden; }
+.barrow .fill { height: 100%; background: var(--bar); border-radius: 0 4px 4px 0; min-width: 2px; }
+.barrow .v { font-variant-numeric: tabular-nums; font-weight: 600; text-align: right; min-width: 72px; }
+.top { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; font-size: 14px; }
+.top li { display: flex; justify-content: space-between; gap: 8px; }
+.top li span:first-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.top li span:last-child { font-variant-numeric: tabular-nums; font-weight: 600; }
+h2.section { font-size: 17px; margin: 6px 0 10px; }
+.list { display: grid; gap: 8px; }
+.entry { display: grid; grid-template-columns: 48px 1fr auto; gap: 10px; align-items: center; background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 8px 10px; text-align: left; color: inherit; font: inherit; cursor: pointer; width: 100%; }
+.entry img { width: 48px; aspect-ratio: 245/342; border-radius: 4px; object-fit: cover; background: var(--chip); }
+.entry .mid { min-width: 0; display: grid; gap: 3px; }
+.entry .name { font-weight: 650; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.chips { display: flex; flex-wrap: wrap; gap: 4px; }
+.chip { background: var(--chip); border-radius: 6px; padding: 1px 6px; font-size: 11px; font-weight: 600; color: var(--fg); }
+.entry .right { text-align: right; font-variant-numeric: tabular-nums; }
+.entry .right .total { font-weight: 700; color: var(--price); }
+.entry .right .each { font-size: 12px; color: var(--muted); }
+
+/* Sheet */
+.sheet-bg { position: fixed; inset: 0; background: rgba(0,0,0,.45); z-index: 30; }
+.sheet {
+  position: fixed; left: 0; right: 0; bottom: 0; z-index: 31; background: var(--surface);
+  border-radius: 18px 18px 0 0; max-height: 92vh; overflow-y: auto;
+  padding: 16px max(16px, env(safe-area-inset-right, 0px)) calc(20px + env(safe-area-inset-bottom, 0px)) max(16px, env(safe-area-inset-left, 0px));
+  max-width: 720px; margin: 0 auto;
+}
+.sheet .row { display: flex; gap: 14px; align-items: flex-start; }
+.sheet .row img { width: 42%; max-width: 220px; border-radius: 10px; }
+.sheet h2 { margin: 0 0 4px; font-size: 20px; text-wrap: balance; }
+.meta { color: var(--muted); font-size: 13px; }
+table { width: 100%; border-collapse: collapse; margin-top: 12px; font-variant-numeric: tabular-nums; }
+td { padding: 7px 0; border-bottom: 1px solid var(--line); }
+td:last-child { text-align: right; font-weight: 600; }
+.note { font-size: 12px; color: var(--muted); margin-top: 10px; }
+.actions { display: grid; gap: 8px; margin-top: 14px; }
+.actions a, .actions button { display: block; text-align: center; text-decoration: none; }
+.ghost { background: var(--chip); color: var(--fg); }
+.danger { background: transparent; color: var(--danger); border: 1px solid var(--line); }
+.close { float: right; border: 0; background: var(--chip); color: var(--fg); border-radius: 999px; width: 32px; height: 32px; font-size: 18px; }
+fieldset.add { border: 1px solid var(--line); border-radius: 12px; margin: 16px 0 0; padding: 12px; display: grid; gap: 10px; }
+fieldset.add legend { font-weight: 700; padding: 0 4px; }
+.fields { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.fields label { display: grid; gap: 4px; font-size: 12px; font-weight: 600; color: var(--muted); min-width: 0; }
+.fields select, .fields input { width: 100%; padding: 9px 10px; border-radius: 9px; border: 1px solid var(--line); background: var(--bg); color: var(--fg); }
+.stepper { display: flex; align-items: center; border: 1px solid var(--line); border-radius: 9px; background: var(--bg); overflow: hidden; }
+.stepper button { border: 0; background: none; color: var(--accent); font: 700 20px var(--font); width: 40px; height: 40px; cursor: pointer; }
+.stepper input { border: 0 !important; text-align: center; background: transparent !important; padding: 0 !important; min-width: 0; -moz-appearance: textfield; }
+.stepper input::-webkit-inner-spin-button { -webkit-appearance: none; }
+.estimate { font-size: 13px; color: var(--muted); }
+.estimate strong { color: var(--price); font-variant-numeric: tabular-nums; }
+.toast { position: fixed; left: 50%; transform: translateX(-50%); bottom: calc(80px + env(safe-area-inset-bottom, 0px)); background: var(--fg); color: var(--bg); padding: 9px 14px; border-radius: 999px; font-size: 14px; font-weight: 600; z-index: 40; }
+
+/* Merkliste */
+.wsum { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; text-align: center; }
+.wsum .big { display: block; font-size: 26px; font-weight: 750; font-variant-numeric: tabular-nums; }
+.wsum .lbl { font-size: 12px; color: var(--muted); font-weight: 600; }
+.dir { font-variant-numeric: tabular-nums; font-size: 13px; font-weight: 700; }
+.dir.up { color: var(--up); } .dir.down { color: var(--down); } .dir.flat, .dir.none { color: var(--muted); }
+.wrow .spark { display: block; margin-top: 4px; max-width: 100%; }
+.wrow .now { font-weight: 700; font-variant-numeric: tabular-nums; }
+.wnow { font-size: 26px; font-weight: 750; font-variant-numeric: tabular-nums; margin-top: 6px; }
+.chartbox { position: relative; margin-top: 12px; }
+.chart { width: 100%; height: auto; display: block; touch-action: pan-y; }
+.tip { position: absolute; top: -6px; background: var(--fg); color: var(--bg); font-size: 12px; font-weight: 600; padding: 3px 8px; border-radius: 6px; white-space: nowrap; pointer-events: none; font-variant-numeric: tabular-nums; }
+button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+@media (max-width: 380px) { .sheet .row { flex-direction: column; } .sheet .row img { width: 60%; } .barrow { grid-template-columns: 80px 1fr auto; } }
+</style>
+</head>
+<body>
+<header>
+  <h1 id="title">Kartenpreise</h1>
+  <form class="search" id="search-form">
+    <input id="q" type="search" placeholder="Kartenname, z. B. Glurak" autocomplete="off" enterkeyhint="search">
+    <button class="btn" type="submit">Suchen</button>
+  </form>
+  <div class="lang" id="lang-row">Kartennamen:
+    <button id="lang-de" aria-pressed="true">Deutsch</button>
+    <button id="lang-en" aria-pressed="false">Englisch</button>
+  </div>
+</header>
+<main>
+  <p class="status" id="status"></p>
+  <div id="view"></div>
+</main>
+<nav class="tabbar" aria-label="Bereiche">
+  <button id="tab-search" aria-pressed="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>Suche</button>
+  <button id="tab-coll" aria-pressed="false"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><rect x="4" y="3" width="12" height="16" rx="2"/><path d="M8 21h10a2 2 0 0 0 2-2V7"/></svg>Sammlung</button>
+  <button id="tab-watch" aria-pressed="false"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><path d="M6 3h12v18l-6-4-6 4z"/></svg>Merkliste</button>
+</nav>
+<div class="sheet-bg" id="sheet-bg" hidden></div>
+<div class="sheet" id="sheet" role="dialog" aria-modal="true" hidden></div>
+
+<script>
+const API = "https://api.tcgdex.net/v2";
+const PAGE = 24;
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const state = { lang: "de", view: "search", query: "" };
+const cache = new Map();
+
+const store = {
+  get(k, d) { try { const v = JSON.parse(localStorage.getItem(k)); return v ?? d; } catch { return d; } },
+  set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} }
+};
+let watch = store.get("watch", window.DEMO_WATCH_SEED || []);
+let coll = store.get("coll", window.DEMO_SEED || []);
+state.lang = store.get("lang", "de");
+
+// Kartensprachen und Zustände wie bei Cardmarket
+const LANGS = { de: "Deutsch", en: "Englisch", fr: "Französisch", it: "Italienisch", es: "Spanisch", pt: "Portugiesisch", ja: "Japanisch", ko: "Koreanisch", zh: "Chinesisch" };
+const CONDS = {
+  MT: { label: "Mint", f: 1.0 }, NM: { label: "Near Mint", f: 1.0 }, EX: { label: "Excellent", f: 0.85 },
+  GD: { label: "Good", f: 0.7 }, LP: { label: "Light Played", f: 0.55 }, PL: { label: "Played", f: 0.4 }, PO: { label: "Poor", f: 0.25 }
+};
+const VARIANTS = { normal: "Normal", holo: "Holo / Reverse Holo" };
+
+const eur = (n) => (typeof n === "number" && n > 0) ? n.toLocaleString("de-DE", { style: "currency", currency: "EUR" }) : "–";
+const img = (base, q) => base ? `${base}/${q}.webp` : "";
+const num = (v) => (typeof v === "number" && v > 0) ? v : null;
+
+function cmUrl(name) {
+  // Cardmarket-Suche, Filter Sprache Englisch (1) + Deutsch (3), Zustand ab Near Mint (2)
+  return `https://www.cardmarket.com/de/Pokemon/Products/Search?category=-1&searchString=${encodeURIComponent(name)}&language=1,3&minCondition=2`;
+}
+
+async function getCard(id, lang) {
+  const key = lang + ":" + id;
+  if (cache.has(key)) return cache.get(key);
+  const p = fetch(`${API}/${lang}/cards/${encodeURIComponent(id)}`).then(r => r.ok ? r.json() : null).catch(() => null);
+  cache.set(key, p);
+  return p;
+}
+const lowPrice = (cm) => cm ? (num(cm.low) ?? num(cm["low-holo"])) : null;
+const trendPrice = (cm) => cm ? (num(cm.trend) ?? num(cm["trend-holo"])) : null;
+
+// Marktpreis für eine Ausführung: Trend, sonst Durchschnitt, sonst ab-Preis
+function marketPrice(cm, variant) {
+  if (!cm) return null;
+  if (variant === "holo") {
+    const h = num(cm["trend-holo"]) ?? num(cm["avg-holo"]) ?? num(cm["low-holo"]);
+    if (h) return h;
+  }
+  return num(cm.trend) ?? num(cm.avg) ?? num(cm.low) ?? num(cm["trend-holo"]);
+}
+function unitValue(e) {
+  if (num(e.customPrice)) return e.customPrice;
+  if (!num(e.price)) return null;
+  return e.price * (CONDS[e.cond]?.f ?? 1);
+}
+const entryValue = (e) => (unitValue(e) ?? 0) * e.qty;
+const saveColl = () => store.set("coll", coll);
+
+function toast(msg) {
+  const t = document.createElement("div"); t.className = "toast"; t.textContent = msg;
+  document.body.appendChild(t); setTimeout(() => t.remove(), 1800);
+}
+
+/* ---------- Suche & Merkliste ---------- */
+function cardTile(brief, full) {
+  const b = document.createElement("button");
+  b.className = "card"; b.type = "button";
+  const cm = full?.pricing?.cardmarket;
+  b.innerHTML = `<img loading="lazy" alt="${esc(brief.name)}" src="${esc(img(brief.image, "low"))}">
+    <div class="info">
+      <div class="name">${esc(brief.name)}</div>
+      <div class="set">${full ? esc(`${full.set?.name ?? ""} · ${full.localId}`) : esc(`Nr. ${brief.localId ?? ""}`)}</div>
+      <div class="price">${full ? `ab ${eur(lowPrice(cm))} <small>· Trend ${eur(trendPrice(cm))}</small>` : "<small>Preis wird geladen…</small>"}</div>
+    </div>`;
+  b.addEventListener("click", () => openCardSheet(brief.id, brief.lang || state.lang));
+  return b;
+}
+async function renderGrid(items) {
+  const grid = document.createElement("div"); grid.className = "grid";
+  $("view").replaceChildren(grid);
+  const tiles = items.map(it => { const t = cardTile(it, null); grid.appendChild(t); return t; });
+  let i = 0;
+  async function worker() {
+    while (i < items.length) {
+      const n = i++; const it = items[n];
+      const full = await getCard(it.id, it.lang || state.lang);
+      if (full) tiles[n].replaceWith(tiles[n] = cardTile(it, full));
+    }
+  }
+  await Promise.all(Array.from({ length: 6 }, worker));
+}
+async function search(q) {
+  state.query = q;
+  const status = $("status");
+  if (!q) { status.textContent = ""; $("view").innerHTML = `<p class="empty">Gib einen Kartennamen ein, zum Beispiel „Glurak“, „Pikachu“ oder „Mewtu“.</p>`; return; }
+  status.textContent = "Suche läuft…"; $("view").innerHTML = "";
+  try {
+    const r = await fetch(`${API}/${state.lang}/cards?name=${encodeURIComponent(q)}&pagination:page=1&pagination:itemsPerPage=${PAGE}`);
+    if (!r.ok) throw new Error(r.status);
+    const list = (await r.json()).filter(c => c.image);
+    if (state.view !== "search") return;
+    if (!list.length) { status.textContent = `Keine Karten zu „${q}“ gefunden. Prüfe die Schreibweise oder wechsle die Sprache der Kartennamen.`; return; }
+    status.textContent = `${list.length} Karten zu „${q}“${list.length === PAGE ? " (die ersten " + PAGE + ")" : ""}. Preise von Cardmarket.`;
+    renderGrid(list);
+  } catch {
+    status.textContent = "Die Kartendatenbank ist gerade nicht erreichbar. Prüfe deine Internetverbindung und versuche es noch einmal.";
+  }
+}
+/* ---------- Merkliste mit Preis-Tracking ---------- */
+const today = () => { const d = new Date(); return new Date(d.getTime() - d.getTimezoneOffset() * 6e4).toISOString().slice(0, 10); };
+const fmtDate = (d) => new Date(d + "T12:00:00").toLocaleDateString("de-DE", { day: "numeric", month: "short" });
+const pct = (v) => (v > 0 ? "+" : v < 0 ? "−" : "±") + Math.abs(v).toLocaleString("de-DE", { maximumFractionDigits: 1, minimumFractionDigits: 1 }) + " %";
+
+// Ein Preispunkt pro Tag (Cardmarket-Trendpreis); der Punkt von heute wird bei Änderungen überschrieben
+function recordPoint(w, cm) {
+  if (!cm) return false;
+  if (num(cm.avg7)) w.avg7 = cm.avg7;
+  if (num(cm.avg30)) w.avg30 = cm.avg30;
+  const p = marketPrice(cm, "normal");
+  if (!p) return false;
+  w.history = w.history || [];
+  const d = today(), last = w.history[w.history.length - 1];
+  if (last && last.d === d) { if (last.p === p) return false; last.p = p; }
+  else w.history.push({ d, p });
+  if (!w.addedAt) w.addedAt = w.history[0].d;
+  return true;
+}
+let watchRefresh = null;
+function refreshWatch() {
+  watchRefresh = watchRefresh || Promise.all(watch.map(async w => {
+    const c = await getCard(w.id, w.lang);
+    return recordPoint(w, c?.pricing?.cardmarket);
+  })).then(r => { if (r.some(Boolean)) store.set("watch", watch); watchRefresh = null; return r.some(Boolean); });
+  return watchRefresh;
+}
+function trendOf(w) {
+  const h = w.history || [];
+  if (h.length >= 2) {
+    const a = h[0].p, b = h[h.length - 1].p, ch = (b - a) / a * 100;
+    return { dir: ch > 2 ? "up" : ch < -2 ? "down" : "flat", ch, start: a, now: b, own: true };
+  }
+  // Noch kein eigener Verlauf: Cardmarket-Durchschnitt 7 Tage gegen 30 Tage
+  const now = h.length ? h[0].p : null;
+  if (num(w.avg7) && num(w.avg30)) {
+    const ch = (w.avg7 - w.avg30) / w.avg30 * 100;
+    return { dir: ch > 3 ? "up" : ch < -3 ? "down" : "flat", ch, start: now, now, own: false };
+  }
+  return { dir: "none", ch: 0, start: now, now, own: false };
+}
+const DIR = {
+  up: { label: "wird teurer", arrow: "▲" }, down: { label: "wird günstiger", arrow: "▼" },
+  flat: { label: "stabil", arrow: "■" }, none: { label: "noch keine Daten", arrow: "·" }
+};
+function sparkSvg(h, w = 120, ht = 32) {
+  if (!h || !h.length) return "";
+  const ps = h.map(x => x.p), min = Math.min(...ps), max = Math.max(...ps), span = max - min || 1;
+  const x = (i) => h.length === 1 ? w - 4 : 3 + i * (w - 7) / (h.length - 1);
+  const y = (v) => max === min ? ht / 2 : 3 + (max - v) * (ht - 6) / span;
+  const pts = h.map((p, i) => `${x(i).toFixed(1)},${y(p.p).toFixed(1)}`).join(" ");
+  const last = h.length - 1;
+  return `<svg class="spark" viewBox="0 0 ${w} ${ht}" width="${w}" height="${ht}" aria-hidden="true">
+    ${h.length > 1 ? `<polygon points="${x(0)},${ht} ${pts} ${x(last)},${ht}" fill="var(--bar)" opacity=".12"/><polyline points="${pts}" fill="none" stroke="var(--bar)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>` : ""}
+    <circle cx="${x(last)}" cy="${y(h[last].p)}" r="3.5" fill="var(--bar)" stroke="var(--surface)" stroke-width="2"/></svg>`;
+}
+function renderWatch() {
+  if (!watch.length) { $("status").textContent = ""; $("view").innerHTML = `<p class="empty">Noch keine Karten gemerkt. Öffne eine Karte und tippe auf „Merken“. Ab dann zeichnet die App den Preis jeden Tag auf, an dem du sie öffnest.</p>`; return; }
+  $("status").textContent = "";
+  const ts = watch.map(trendOf);
+  const n = (d) => ts.filter(t => t.dir === d).length;
+  $("view").innerHTML = `
+    <div class="panel wsum">
+      <div><span class="big">${n("up")}</span><span class="lbl"><span class="dir up">▲</span> teurer</span></div>
+      <div><span class="big">${n("down")}</span><span class="lbl"><span class="dir down">▼</span> günstiger</span></div>
+      <div><span class="big">${n("flat")}</span><span class="lbl"><span class="dir flat">■</span> stabil</span></div>
+    </div>
+    <p class="note" style="margin:8px 0 14px">Veränderung seit du die Karte gemerkt hast, gemessen am Cardmarket-Trendpreis. Solange es nur einen Messpunkt gibt, zeigt die Tendenz den Cardmarket-Schnitt der letzten 7 gegen 30 Tage.</p>
+    <div class="list" id="wl"></div>`;
+  const list = $("wl");
+  watch.map((w, i) => ({ w, t: ts[i], i })).sort((a, b) => Math.abs(b.t.ch) - Math.abs(a.t.ch)).forEach(({ w, t, i }) => {
+    const b = document.createElement("button"); b.className = "entry wrow"; b.type = "button";
+    b.innerHTML = `<img alt="" loading="lazy" src="${esc(img(w.image, "low"))}">
+      <div class="mid"><div class="name">${esc(w.name)}</div>
+        <div class="meta">gemerkt ${w.addedAt ? "am " + fmtDate(w.addedAt) : "heute"} · ${t.start ? eur(t.start) : "–"}</div>
+        ${sparkSvg(w.history)}</div>
+      <div class="right"><div class="now">${eur(t.now)}</div>
+        <div class="dir ${t.dir}">${DIR[t.dir].arrow} ${t.dir === "none" ? "–" : pct(t.ch)}</div>
+        <div class="each">${DIR[t.dir].label}${t.own || t.dir === "none" ? "" : "*"}</div></div>`;
+    b.addEventListener("click", () => openWatchSheet(i));
+    list.appendChild(b);
+  });
+}
+function chartSvg(h, start) {
+  const W = 340, H = 170, L = 8, R = 62, T = 12, B = 24;
+  const ps = h.map(x => x.p), min = Math.min(...ps, start ?? Infinity), max = Math.max(...ps, start ?? -Infinity);
+  const pad = (max - min) * 0.12 || max * 0.05 || 1, lo = min - pad, hi = max + pad;
+  const t0 = new Date(h[0].d).getTime(), t1 = new Date(h[h.length - 1].d).getTime(), span = t1 - t0 || 1;
+  const x = (d) => h.length === 1 ? W - R : L + (new Date(d).getTime() - t0) / span * (W - L - R);
+  const y = (v) => T + (hi - v) / (hi - lo) * (H - T - B);
+  const pts = h.map(p => `${x(p.d).toFixed(1)},${y(p.p).toFixed(1)}`).join(" ");
+  const ticks = [hi - pad, (hi + lo) / 2, lo + pad];
+  const last = h[h.length - 1];
+  return `<svg viewBox="0 0 ${W} ${H}" class="chart" role="img" aria-label="Preisverlauf">
+    ${ticks.map(v => `<line x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}" stroke="var(--line)" stroke-width="1"/><text x="${W - R + 6}" y="${y(v) + 4}" font-size="11" fill="var(--muted)">${eur(v)}</text>`).join("")}
+    ${start ? `<line x1="${L}" x2="${W - R}" y1="${y(start)}" y2="${y(start)}" stroke="var(--muted)" stroke-dasharray="4 4" stroke-width="1"/>` : ""}
+    ${h.length > 1 ? `<polygon points="${x(h[0].d)},${H - B} ${pts} ${x(last.d)},${H - B}" fill="var(--bar)" opacity=".12"/><polyline points="${pts}" fill="none" stroke="var(--bar)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>` : ""}
+    <circle cx="${x(last.d)}" cy="${y(last.p)}" r="4.5" fill="var(--bar)" stroke="var(--surface)" stroke-width="2"/>
+    <text x="${L}" y="${H - 6}" font-size="11" fill="var(--muted)">${fmtDate(h[0].d)}</text>
+    <text x="${W - R}" y="${H - 6}" font-size="11" fill="var(--muted)" text-anchor="end">${fmtDate(last.d)}</text>
+    <line class="cross" x1="0" x2="0" y1="${T}" y2="${H - B}" stroke="var(--muted)" stroke-width="1" visibility="hidden"/>
+    <circle class="hov" r="4.5" fill="var(--bar)" stroke="var(--surface)" stroke-width="2" visibility="hidden"/>
+    <rect x="0" y="0" width="${W}" height="${H}" fill="transparent" class="hit"/>
+  </svg>`;
+}
+function wireChart(box, h) {
+  const svg = box.querySelector("svg.chart"); if (!svg || h.length < 2) return;
+  const tip = box.querySelector(".tip"), cross = svg.querySelector(".cross"), hov = svg.querySelector(".hov");
+  const pts = [...svg.querySelector("polyline").getAttribute("points").split(" ")].map(s => s.split(",").map(Number));
+  const move = (ev) => {
+    const r = svg.getBoundingClientRect(), sx = (ev.clientX - r.left) / r.width * 340;
+    let k = 0; pts.forEach((p, i) => { if (Math.abs(p[0] - sx) < Math.abs(pts[k][0] - sx)) k = i; });
+    const [px, py] = pts[k];
+    cross.setAttribute("x1", px); cross.setAttribute("x2", px); cross.setAttribute("visibility", "visible");
+    hov.setAttribute("cx", px); hov.setAttribute("cy", py); hov.setAttribute("visibility", "visible");
+    tip.hidden = false; tip.textContent = `${fmtDate(h[k].d)}: ${eur(h[k].p)}`;
+    tip.style.left = Math.min(Math.max(px / 340 * r.width - 50, 0), r.width - 110) + "px";
+  };
+  const hide = () => { tip.hidden = true; cross.setAttribute("visibility", "hidden"); hov.setAttribute("visibility", "hidden"); };
+  svg.addEventListener("pointermove", move); svg.addEventListener("pointerdown", move); svg.addEventListener("pointerleave", hide);
+}
+function openWatchSheet(i) {
+  const w = watch[i]; if (!w) return;
+  const t = trendOf(w), h = w.history || [];
+  const ps = h.map(x => x.p);
+  const rows = [
+    ["Preis beim Merken" + (w.addedAt ? ` (${fmtDate(w.addedAt)})` : ""), t.start], ["Aktueller Trendpreis", t.now],
+    ["Höchster Preis seitdem", ps.length ? Math.max(...ps) : null], ["Tiefster Preis seitdem", ps.length ? Math.min(...ps) : null],
+    ["Cardmarket Ø 7 Tage", w.avg7], ["Cardmarket Ø 30 Tage", w.avg30]
+  ].filter(([, v]) => num(v));
+  let sentence;
+  if (t.own) sentence = `Seit du die Karte gemerkt hast, ist sie um ${pct(t.ch)} ${t.dir === "up" ? "teurer geworden" : t.dir === "down" ? "günstiger geworden" : "kaum verändert (stabil)"}.`;
+  else if (t.dir !== "none") sentence = `Noch kein eigener Verlauf. Laut Cardmarket liegt der Schnitt der letzten 7 Tage ${pct(t.ch)} gegenüber den letzten 30 Tagen, die Karte ${DIR[t.dir].label}.`;
+  else sentence = "Noch nicht genug Daten. Öffne die App in den nächsten Tagen wieder, dann entsteht der Verlauf.";
+  showSheet(`
+    <button class="close" aria-label="Schließen">×</button>
+    <div class="row">
+      <img alt="${esc(w.name)}" src="${esc(img(w.image, "high"))}" style="width:30%">
+      <div><h2>${esc(w.name)}</h2>
+        <div class="meta">Nr. ${esc(w.localId ?? "")}</div>
+        <div class="wnow">${eur(t.now)}</div>
+        <div class="dir ${t.dir}" style="font-weight:700">${DIR[t.dir].arrow} ${t.dir === "none" ? "" : pct(t.ch) + " · "}${DIR[t.dir].label}</div></div>
+    </div>
+    <p class="note" style="font-size:13px">${sentence}</p>
+    ${h.length ? `<div class="chartbox"><div class="tip" hidden></div>${chartSvg(h, t.start)}</div><p class="note" style="margin-top:4px">Gestrichelte Linie: Preis beim Merken. ${h.length} Messpunkte, einer pro Tag, an dem du die App geöffnet hast.</p>` : ""}
+    <table>${rows.map(([k, v]) => `<tr><td>${k}</td><td>${eur(v)}</td></tr>`).join("")}</table>
+    <div class="actions">
+      <button class="btn ghost" id="w-card">Kartendetails und Sammlung</button>
+      <a class="btn ghost" target="_blank" rel="noopener" href="${cmUrl(w.name)}">Angebote auf Cardmarket (DE/EN, Near Mint)</a>
+      <button class="btn danger" id="w-del">Von Merkliste entfernen</button>
+    </div>`);
+  wireChart($("sheet"), h);
+  $("w-card").onclick = () => openCardSheet(w.id, w.lang);
+  let armed = false;
+  $("w-del").onclick = () => {
+    if (!armed) { armed = true; $("w-del").textContent = "Wirklich entfernen? Der Verlauf geht verloren. Nochmal tippen"; return; }
+    watch = watch.filter(x => x !== w); store.set("watch", watch); closeSheet(); renderWatch(); toast("Von Merkliste entfernt");
+  };
+}
+
+/* ---------- Sammlung & Dashboard ---------- */
+async function refreshPrices() {
+  const keys = [...new Set(coll.map(e => e.dataLang + "|" + e.id))];
+  let changed = false;
+  await Promise.all(keys.map(async k => {
+    const [lang, id] = k.split("|");
+    const c = await getCard(id, lang);
+    const cm = c?.pricing?.cardmarket;
+    if (!cm) return;
+    coll.forEach(e => {
+      if (e.id === id && e.dataLang === lang) {
+        const p = marketPrice(cm, e.variant);
+        if (p && p !== e.price) { e.price = p; changed = true; }
+        if (cm.updated) e.priceDate = cm.updated;
+      }
+    });
+  }));
+  if (changed) saveColl();
+  return changed;
+}
+function groupSum(key, labels) {
+  const m = new Map();
+  coll.forEach(e => m.set(e[key], (m.get(e[key]) ?? 0) + entryValue(e)));
+  return [...m.entries()].map(([k, v]) => ({ label: labels[k] ?? k, v })).sort((a, b) => b.v - a.v);
+}
+function barsHtml(rows) {
+  const max = Math.max(...rows.map(r => r.v), 0.01);
+  return `<div class="bars">${rows.map(r => `<div class="barrow" title="${esc(r.label)}: ${eur(r.v)}">
+    <span>${esc(r.label)}</span><div class="track"><div class="fill" style="width:${(r.v / max * 100).toFixed(1)}%"></div></div><span class="v">${eur(r.v)}</span></div>`).join("")}</div>`;
+}
+function renderColl() {
+  const status = $("status");
+  if (!coll.length) {
+    status.textContent = "";
+    $("view").innerHTML = `<p class="empty">Deine Sammlung ist noch leer. Such eine Karte, öffne sie und trag unter „Zur Sammlung hinzufügen“ Anzahl, Sprache und Zustand ein. Hier siehst du dann den Gesamtwert.</p>`;
+    return;
+  }
+  status.textContent = "";
+  const total = coll.reduce((s, e) => s + entryValue(e), 0);
+  const count = coll.reduce((s, e) => s + e.qty, 0);
+  const unique = new Set(coll.map(e => e.id)).size;
+  const missing = coll.filter(e => unitValue(e) == null).length;
+  const sorted = [...coll].sort((a, b) => entryValue(b) - entryValue(a));
+  const best = [...coll].sort((a, b) => (unitValue(b) ?? 0) - (unitValue(a) ?? 0))[0];
+  const dates = coll.map(e => e.priceDate).filter(Boolean).sort();
+  const stand = dates.length ? new Date(dates[dates.length - 1]).toLocaleDateString("de-DE") : null;
+
+  $("view").innerHTML = `
+  <section class="dash" aria-label="Dashboard">
+    <div class="panel hero">
+      <p class="label">Geschätzter Sammlungswert</p>
+      <div class="value">${total > 0 ? eur(total) : "–"}</div>
+      <div class="sub">${count} Karten · ${unique} verschiedene${stand ? " · Preise Stand " + stand : ""}${missing ? ` · ${missing} ohne Preis` : ""}</div>
+    </div>
+    <div class="tiles">
+      <div class="panel tile"><p class="label">Wertvollste Karte</p><div class="value">${eur(unitValue(best))}</div><div class="sub">${esc(best.name)}</div></div>
+      <div class="panel tile"><p class="label">Ø pro Karte</p><div class="value">${eur(count ? total / count : 0)}</div><div class="sub">über alle Exemplare</div></div>
+    </div>
+    <div class="two">
+      <div class="panel"><h3>Wert nach Sprache</h3>${barsHtml(groupSum("cardLang", LANGS))}</div>
+      <div class="panel"><h3>Wert nach Zustand</h3>${barsHtml(groupSum("cond", Object.fromEntries(Object.entries(CONDS).map(([k, v]) => [k, v.label]))))}</div>
+    </div>
+    <div class="panel"><h3>Top 5</h3><ol class="top">${sorted.slice(0, 5).map(e => `<li><span>${e.qty}× ${esc(e.name)}</span><span>${eur(entryValue(e))}</span></li>`).join("")}</ol></div>
+    <p class="note">Der Wert ist eine Schätzung: Cardmarket-Trendpreis der Karte, angepasst an den Zustand (Excellent 85 %, Good 70 %, Light Played 55 %, Played 40 %, Poor 25 %). Die Sprache fließt nicht ein, weil Cardmarket keinen Preis pro Sprache liefert. Mit einem eigenen Preis bei der Karte kannst du die Schätzung überschreiben.</p>
+  </section>
+  <h2 class="section">Deine Karten</h2>
+  <div class="list" id="entries"></div>`;
+  const list = $("entries");
+  sorted.forEach(e => {
+    const b = document.createElement("button"); b.className = "entry"; b.type = "button";
+    const u = unitValue(e);
+    b.innerHTML = `<img alt="" loading="lazy" src="${esc(img(e.image, "low"))}">
+      <div class="mid"><div class="name">${esc(e.name)}</div>
+        <div class="meta">${esc(e.set ?? "")} · ${esc(e.localId ?? "")}</div>
+        <div class="chips"><span class="chip">${e.qty}×</span><span class="chip">${esc(LANGS[e.cardLang] ?? e.cardLang)}</span><span class="chip">${esc(e.cond)}</span>${e.variant === "holo" ? `<span class="chip">Holo</span>` : ""}${num(e.customPrice) ? `<span class="chip">eigener Preis</span>` : ""}</div></div>
+      <div class="right"><div class="total">${u ? eur(u * e.qty) : "–"}</div><div class="each">${u ? "je " + eur(u) : "kein Preis"}</div></div>`;
+    b.addEventListener("click", () => openEntrySheet(e.uid));
+    list.appendChild(b);
+  });
+}
+
+/* ---------- Formular für Sammlungseinträge ---------- */
+function formHtml(v, cm) {
+  const opt = (obj, sel, fn = x => x) => Object.entries(obj).map(([k, x]) => `<option value="${k}"${k === sel ? " selected" : ""}>${esc(fn(x))}</option>`).join("");
+  const hasHolo = cm && (num(cm["trend-holo"]) || num(cm["avg-holo"]) || num(cm["low-holo"]));
+  return `<div class="fields">
+      <label>Anzahl<div class="stepper"><button type="button" data-step="-1" aria-label="Weniger">−</button><input id="f-qty" type="number" inputmode="numeric" min="1" value="${v.qty}"><button type="button" data-step="1" aria-label="Mehr">+</button></div></label>
+      <label>Sprache<select id="f-lang">${opt(LANGS, v.cardLang)}</select></label>
+      <label>Zustand<select id="f-cond">${opt(CONDS, v.cond, x => x.label)}</select></label>
+      <label>Ausführung<select id="f-var">${opt(hasHolo || v.variant === "holo" ? VARIANTS : { normal: "Normal" }, v.variant)}</select></label>
+      <label style="grid-column:1/-1">Eigener Preis pro Stück (optional, €)<input id="f-price" type="text" inputmode="decimal" placeholder="leer = Schätzung" value="${num(v.customPrice) ? String(v.customPrice).replace(".", ",") : ""}"></label>
+    </div>
+    <div class="estimate" id="f-est"></div>`;
+}
+function readForm() {
+  const p = parseFloat(($("f-price").value || "").replace(/\./g, "").replace(",", "."));
+  return {
+    qty: Math.max(1, parseInt($("f-qty").value, 10) || 1),
+    cardLang: $("f-lang").value, cond: $("f-cond").value, variant: $("f-var").value,
+    customPrice: num(p)
+  };
+}
+function wireForm(cm) {
+  const update = () => {
+    const v = readForm();
+    const e = { ...v, price: marketPrice(cm, v.variant) };
+    const u = unitValue(e);
+    $("f-est").innerHTML = u ? `Wert: <strong>${eur(u * v.qty)}</strong> (${v.qty} × ${eur(u)}${num(v.customPrice) ? ", eigener Preis" : ""})` : "Für diese Karte gibt es keinen Marktpreis. Trag einen eigenen Preis ein, damit sie im Wert zählt.";
+  };
+  $("sheet").querySelectorAll("[data-step]").forEach(b => b.onclick = () => {
+    $("f-qty").value = Math.max(1, (parseInt($("f-qty").value, 10) || 1) + Number(b.dataset.step)); update();
+  });
+  ["f-qty", "f-lang", "f-cond", "f-var", "f-price"].forEach(id => $(id).addEventListener("input", update));
+  update();
+}
+
+/* ---------- Sheets ---------- */
+function showSheet(html) {
+  const sheet = $("sheet"); sheet.innerHTML = html;
+  sheet.hidden = false; $("sheet-bg").hidden = false;
+  const c = sheet.querySelector(".close"); if (c) c.onclick = closeSheet;
+  return sheet;
+}
+function closeSheet() { $("sheet").hidden = true; $("sheet-bg").hidden = true; }
+$("sheet-bg").onclick = closeSheet;
+document.addEventListener("keydown", e => { if (e.key === "Escape") closeSheet(); });
+
+async function openCardSheet(id, lang) {
+  showSheet(`<p class="meta">Lade Karte…</p>`);
+  const c = await getCard(id, lang);
+  if (!c) { showSheet(`<button class="close" aria-label="Schließen">×</button><p>Diese Karte konnte nicht geladen werden.</p>`); return; }
+  const cm = c.pricing?.cardmarket;
+  const rows = cm ? [
+    ["Ab-Preis", cm.low], ["Trendpreis", cm.trend], ["Durchschnitt (Verkäufe)", cm.avg],
+    ["Ø 7 Tage", cm.avg7], ["Ø 30 Tage", cm.avg30],
+    ["Ab-Preis Holo/Reverse", cm["low-holo"]], ["Trend Holo/Reverse", cm["trend-holo"]],
+  ].filter(([, v]) => num(v)) : [];
+  const saved = watch.some(w => w.id === c.id && w.lang === lang);
+  const owned = coll.filter(e => e.id === c.id).reduce((s, e) => s + e.qty, 0);
+  showSheet(`
+    <button class="close" aria-label="Schließen">×</button>
+    <div class="row">
+      <img alt="${esc(c.name)}" src="${esc(img(c.image, "high"))}">
+      <div>
+        <h2>${esc(c.name)}</h2>
+        <div class="meta">${esc(c.set?.name ?? "")} · Nr. ${esc(c.localId)}${c.set?.cardCount?.official ? "/" + c.set.cardCount.official : ""}</div>
+        <div class="meta">${esc(c.rarity ?? "")}</div>
+        ${owned ? `<div class="meta"><strong>${owned}× in deiner Sammlung</strong></div>` : ""}
+      </div>
+    </div>
+    ${rows.length ? `<table>${rows.map(([k, v]) => `<tr><td>${k}</td><td>${eur(v)}</td></tr>`).join("")}</table>` : `<p class="note">Für diese Karte liegen keine Cardmarket-Preise vor.</p>`}
+    <p class="note">Cardmarket fasst diese Preise über alle Sprachen und Zustände zusammen${cm?.updated ? ", Stand " + new Date(cm.updated).toLocaleDateString("de-DE") : ""}.</p>
+    <fieldset class="add"><legend>Zur Sammlung hinzufügen</legend>
+      ${formHtml({ qty: 1, cardLang: lang === "en" ? "en" : "de", cond: "NM", variant: "normal" }, cm)}
+      <button class="btn" id="add">Zur Sammlung hinzufügen</button>
+    </fieldset>
+    <div class="actions">
+      <a class="btn ghost" target="_blank" rel="noopener" href="${cmUrl(c.name)}">Angebote auf Cardmarket (DE/EN, Near Mint)</a>
+      <button class="btn ghost" id="save">${saved ? "Von Merkliste entfernen" : "Merken"}</button>
+    </div>`);
+  wireForm(cm);
+  $("add").onclick = () => {
+    const v = readForm();
+    const same = coll.find(e => e.id === c.id && e.cardLang === v.cardLang && e.cond === v.cond && e.variant === v.variant && (e.customPrice ?? null) === (v.customPrice ?? null));
+    if (same) same.qty += v.qty;
+    else coll.push({ uid: Date.now().toString(36) + Math.random().toString(36).slice(2, 6), id: c.id, dataLang: lang, name: c.name, image: c.image, localId: c.localId, set: c.set?.name, ...v, price: marketPrice(cm, v.variant), priceDate: cm?.updated ?? null });
+    saveColl(); closeSheet();
+    toast(`${v.qty}× ${c.name} zur Sammlung hinzugefügt`);
+  };
+  $("save").onclick = () => {
+    if (saved) watch = watch.filter(w => !(w.id === c.id && w.lang === lang));
+    else { const w = { id: c.id, lang, name: c.name, image: c.image, localId: c.localId, addedAt: today(), history: [] }; recordPoint(w, cm); watch.push(w); }
+    store.set("watch", watch); closeSheet();
+    toast(saved ? "Von Merkliste entfernt" : "Gemerkt. Der Preis wird ab heute verfolgt.");
+    if (state.view === "watch") renderWatch();
+  };
+}
+
+async function openEntrySheet(uid) {
+  const e = coll.find(x => x.uid === uid); if (!e) return;
+  const c = await getCard(e.id, e.dataLang);
+  const cm = c?.pricing?.cardmarket ?? (e.variant === "holo" ? { "trend-holo": e.price } : { trend: e.price });
+  showSheet(`
+    <button class="close" aria-label="Schließen">×</button>
+    <div class="row">
+      <img alt="${esc(e.name)}" src="${esc(img(e.image, "high"))}" style="width:30%">
+      <div><h2>${esc(e.name)}</h2><div class="meta">${esc(e.set ?? "")} · Nr. ${esc(e.localId)}</div>
+      <div class="meta">Marktpreis (Trend): ${eur(e.price)}</div></div>
+    </div>
+    <fieldset class="add"><legend>Eintrag bearbeiten</legend>${formHtml(e, cm)}
+      <button class="btn" id="upd">Speichern</button>
+    </fieldset>
+    <div class="actions">
+      <button class="btn ghost" id="open-card">Kartendetails und Preise</button>
+      <button class="btn danger" id="del">Aus Sammlung entfernen</button>
+      <p class="note" id="del-confirm" hidden></p>
+    </div>`);
+  wireForm(cm);
+  $("upd").onclick = () => {
+    const v = readForm();
+    Object.assign(e, v, { price: marketPrice(cm, v.variant) ?? e.price });
+    saveColl(); closeSheet(); renderColl(); toast("Gespeichert");
+  };
+  $("open-card").onclick = () => openCardSheet(e.id, e.dataLang);
+  let armed = false;
+  $("del").onclick = () => {
+    if (!armed) { armed = true; $("del").textContent = "Wirklich entfernen? Nochmal tippen"; return; }
+    coll = coll.filter(x => x.uid !== uid); saveColl(); closeSheet(); renderColl(); toast("Entfernt");
+  };
+}
+
+/* ---------- Navigation ---------- */
+function setLang(l) {
+  state.lang = l; store.set("lang", l);
+  $("lang-de").setAttribute("aria-pressed", l === "de");
+  $("lang-en").setAttribute("aria-pressed", l === "en");
+  $("q").placeholder = l === "de" ? "Kartenname, z. B. Glurak" : "Card name, e.g. Charizard";
+  if (state.view === "search" && state.query) search(state.query);
+}
+async function setView(v) {
+  state.view = v;
+  ["search", "coll", "watch"].forEach(k => $("tab-" + k).setAttribute("aria-pressed", k === v));
+  $("search-form").hidden = v !== "search";
+  $("lang-row").hidden = v !== "search";
+  $("title").textContent = { search: "Kartenpreise", coll: "Meine Sammlung", watch: "Merkliste" }[v];
+  window.scrollTo(0, 0);
+  if (v === "watch") { renderWatch(); if (watch.length && await refreshWatch() && state.view === "watch") renderWatch(); }
+  else if (v === "coll") { renderColl(); if (coll.length && await refreshPrices() && state.view === "coll") renderColl(); }
+  else search(state.query);
+}
+$("lang-de").onclick = () => setLang("de");
+$("lang-en").onclick = () => setLang("en");
+$("tab-search").onclick = () => setView("search");
+$("tab-coll").onclick = () => setView("coll");
+$("tab-watch").onclick = () => setView("watch");
+$("search-form").addEventListener("submit", e => { e.preventDefault(); $("q").blur(); search($("q").value.trim()); });
+
+setLang(state.lang);
+$("q").value = state.lang === "en" ? "Charizard" : "Glurak";
+state.query = $("q").value;
+setView(coll.length ? "coll" : "search");
+refreshWatch(); // Preise der Merkliste bei jedem Öffnen der App aufzeichnen
+
+if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(() => {});
+</script>
+</body>
+</html>
