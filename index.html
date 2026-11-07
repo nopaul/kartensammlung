@@ -137,6 +137,7 @@ fieldset.add legend { font-weight: 700; padding: 0 4px; }
 .wsum { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; text-align: center; }
 .wsum .big { display: block; font-size: 26px; font-weight: 750; font-variant-numeric: tabular-nums; }
 .wsum .lbl { font-size: 12px; color: var(--muted); font-weight: 600; }
+.lang-chip { background: var(--accent); color: var(--accent-fg); }
 .dir { font-variant-numeric: tabular-nums; font-size: 13px; font-weight: 700; }
 .dir.up { color: var(--up); } .dir.down { color: var(--down); } .dir.flat, .dir.none { color: var(--muted); }
 .wrow .spark { display: block; margin-top: 4px; max-width: 100%; }
@@ -153,7 +154,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible
 <header>
   <h1 id="title">Kartenpreise</h1>
   <form class="search" id="search-form">
-    <input id="q" type="search" placeholder="Kartenname, z. B. Glurak" autocomplete="off" enterkeyhint="search">
+    <input id="q" type="search" placeholder="Kartenname, z. B. Glurak 30c" autocomplete="off" enterkeyhint="search">
     <button class="btn" type="submit">Suchen</button>
   </form>
   <div class="lang" id="lang-row">Kartennamen:
@@ -201,9 +202,12 @@ const eur = (n) => (typeof n === "number" && n > 0) ? n.toLocaleString("de-DE", 
 const img = (base, q) => base ? `${base}/${q}.webp` : "";
 const num = (v) => (typeof v === "number" && v > 0) ? v : null;
 
-function cmUrl(name) {
-  // Cardmarket-Suche, Filter Sprache Englisch (1) + Deutsch (3), Zustand ab Near Mint (2)
-  return `https://www.cardmarket.com/de/Pokemon/Products/Search?category=-1&searchString=${encodeURIComponent(name)}&language=1,3&minCondition=2`;
+// Cardmarket-Sprachcodes: 1 Englisch, 2 Französisch, 3 Deutsch, 4 Spanisch, 5 Italienisch, 7 Japanisch, 8 Portugiesisch, 10 Koreanisch
+const CM_LANG = { en: 1, fr: 2, de: 3, es: 4, it: 5, ja: 7, pt: 8, ko: 10 };
+function cmUrl(name, cardLang) {
+  // Cardmarket-Suche, Zustand ab Near Mint (2); ohne Sprachangabe Deutsch + Englisch
+  const l = CM_LANG[cardLang] ? String(CM_LANG[cardLang]) : "1,3";
+  return `https://www.cardmarket.com/de/Pokemon/Products/Search?category=-1&searchString=${encodeURIComponent(name)}&language=${l}&minCondition=2`;
 }
 
 async function getCard(id, lang) {
@@ -252,9 +256,10 @@ function cardTile(brief, full) {
   b.addEventListener("click", () => openCardSheet(brief.id, brief.lang || state.lang));
   return b;
 }
-async function renderGrid(items) {
+async function renderGrid(items, append) {
   const grid = document.createElement("div"); grid.className = "grid";
-  $("view").replaceChildren(grid);
+  if (append) { grid.style.marginTop = $("view").children.length ? "12px" : "0"; $("view").appendChild(grid); }
+  else $("view").replaceChildren(grid);
   const tiles = items.map(it => { const t = cardTile(it, null); grid.appendChild(t); return t; });
   let i = 0;
   async function worker() {
@@ -266,21 +271,123 @@ async function renderGrid(items) {
   }
   await Promise.all(Array.from({ length: 6 }, worker));
 }
+/* ---------- Sets und Setkürzel ---------- */
+const setCache = {};
+async function getSets(lang) {
+  if (setCache[lang]) return setCache[lang];
+  setCache[lang] = fetch(`${API}/${lang}/sets`).then(r => r.ok ? r.json() : []).catch(() => []);
+  const list = await setCache[lang];
+  if (!list.length) delete setCache[lang];
+  return list;
+}
+const norm = (s) => String(s || "").toLowerCase().normalize("NFD").replace(/[̀-ͯ]/g, "").replace(/[^a-z0-9.]/g, "");
+// Kürzel aus dem Setnamen: Zahlen bleiben, sonst Anfangsbuchstaben ("30th Celebration" -> "30c", "Paldea Evolved" -> "pe")
+function initials(name) {
+  return String(name || "").split(/[\s\-–:&]+/).filter(Boolean).map(w => /^\d/.test(w) ? w.match(/^\d+/)[0] : w[0]).join("").toLowerCase();
+}
+// Offizielle Kürzel (z. B. "MEW", "OBF", "PAL") stehen nur in den Set-Details; einmal laden und eine Woche merken
+async function officialCodes(lang) {
+  const key = "codes-" + lang, cached = store.get(key, null);
+  if (cached && Date.now() - cached.t < 7 * 864e5) return cached.m;
+  const sets = await getSets(lang), m = {};
+  let i = 0;
+  async function worker() {
+    while (i < sets.length) {
+      const st = sets[i++];
+      const d = await fetch(`${API}/${lang}/sets/${encodeURIComponent(st.id)}`).then(r => r.ok ? r.json() : null).catch(() => null);
+      [d?.tcgOnline, d?.abbreviation?.official, d?.abbreviation?.normal].forEach(c => { if (c) m[norm(c)] = st.id; });
+    }
+  }
+  await Promise.all(Array.from({ length: 8 }, worker));
+  if (Object.keys(m).length) store.set(key, { t: Date.now(), m });
+  return m;
+}
+async function findSet(token, lang, deep) {
+  const t = norm(token); if (!t || t.length < 2) return null;
+  const sets = await getSets(lang);
+  let hit = sets.find(s => norm(s.id) === t) || sets.find(s => initials(s.name) === t);
+  if (!hit && deep) { const m = await officialCodes(lang); if (m[t]) hit = sets.find(s => s.id === m[t]); }
+  return hit || null;
+}
+// Zerlegt "Glurak 30c" bzw. "Pikachu MEW 25" in Name, Set und Kartennummer
+async function parseQuery(q, lang) {
+  const parts = q.trim().split(/\s+/);
+  let set = null, number = null;
+  if (parts.length > 2 && /^\d{1,3}[a-z]?$/i.test(parts[parts.length - 1])) number = parts.pop();
+  // Das letzte Wort ist ein Setkürzel, wenn davor noch ein Kartenname steht
+  const tok = parts.length > 1 ? parts[parts.length - 1] : null;
+  let setLang = lang;
+  const SUFFIX = ["ex", "gx", "v", "vmax", "vstar", "lv", "break", "prime", "star", "delta", "mega", "tag", "team", "legend"];
+  if (tok && tok.length <= 8 && !SUFFIX.includes(norm(tok))) {
+    // erst in der eingestellten Sprache suchen, dann in der anderen (neue Sets gibt es oft zuerst nur auf Englisch)
+    for (const l of [lang, lang === "de" ? "en" : "de"]) {
+      set = await findSet(tok, l, false);
+      if (!set && tok.length <= 5) set = await findSet(tok, l, true);
+      if (set) { setLang = l; break; }
+    }
+    if (set) parts.pop();
+  }
+  if (!set && number) { parts.push(number); number = null; }
+  return { name: parts.join(" "), set, number, setLang };
+}
+async function cardsOfSet(setId, lang) {
+  const key = "set:" + lang + ":" + setId;
+  if (!cache.has(key)) cache.set(key, fetch(`${API}/${lang}/sets/${encodeURIComponent(setId)}`).then(r => r.ok ? r.json() : null).catch(() => null));
+  return cache.get(key);
+}
+
 async function search(q) {
   state.query = q;
   const status = $("status");
-  if (!q) { status.textContent = ""; $("view").innerHTML = `<p class="empty">Gib einen Kartennamen ein, zum Beispiel „Glurak“, „Pikachu“ oder „Mewtu“.</p>`; return; }
+  if (!q) { status.textContent = ""; $("view").innerHTML = `<p class="empty">Gib einen Kartennamen ein, zum Beispiel „Glurak“, „Pikachu“ oder „Mewtu“. Mit Setkürzel dahinter grenzt du auf ein Set ein, etwa „Glurak 30c“ oder „Pikachu MEW“.</p>`; return; }
   status.textContent = "Suche läuft…"; $("view").innerHTML = "";
+  const myQuery = q;
   try {
-    const r = await fetch(`${API}/${state.lang}/cards?name=${encodeURIComponent(q)}&pagination:page=1&pagination:itemsPerPage=${PAGE}`);
-    if (!r.ok) throw new Error(r.status);
-    const list = (await r.json()).filter(c => c.image);
-    if (state.view !== "search") return;
-    if (!list.length) { status.textContent = `Keine Karten zu „${q}“ gefunden. Prüfe die Schreibweise oder wechsle die Sprache der Kartennamen.`; return; }
-    status.textContent = `${list.length} Karten zu „${q}“${list.length === PAGE ? " (die ersten " + PAGE + ")" : ""}. Preise von Cardmarket.`;
-    renderGrid(list);
+    const pq = await parseQuery(q, state.lang);
+    let list = [];
+    if (pq.set) {
+      const sd = await cardsOfSet(pq.set.id, pq.setLang);
+      if (!sd) throw new Error("set");
+      const n = norm(pq.name);
+      list = (sd.cards || []).map(c => ({ ...c, lang: pq.setLang })).filter(c => (!n || norm(c.name).includes(n)) && (!pq.number || String(c.localId).replace(/^0+/, "").toLowerCase() === pq.number.replace(/^0+/, "").toLowerCase()));
+      if (!list.length) pq.set = null; // kein Treffer im Set: normal nach dem ganzen Text suchen
+    }
+    if (!pq.set) {
+      for (let page = 1; page <= 4; page++) {
+        const r = await fetch(`${API}/${state.lang}/cards?name=${encodeURIComponent(q)}&pagination:page=${page}&pagination:itemsPerPage=100`);
+        if (!r.ok) throw new Error(r.status);
+        const part = await r.json();
+        list.push(...part);
+        if (part.length < 100) break;
+      }
+    }
+    list = list.filter(c => c.image);
+    if (state.view !== "search" || state.query !== myQuery) return;
+    const label = pq.set ? `„${pq.name || "alle Karten"}“ im Set ${pq.set.name}${pq.number ? ", Nr. " + pq.number : ""}` : `„${q}“`;
+    if (!list.length) {
+      status.textContent = `Keine Karten zu ${label} gefunden. Prüfe die Schreibweise oder stell die Kartennamen auf ${state.lang === "de" ? "Englisch" : "Deutsch"} um, manche neuen Sets gibt es in der Datenbank nur auf Englisch.`;
+      return;
+    }
+    status.textContent = `${list.length} Karten zu ${label}${pq.set && pq.setLang !== state.lang ? " (Set nur auf " + (pq.setLang === "en" ? "Englisch" : "Deutsch") + " in der Datenbank)" : ""}. Preise von Cardmarket.`;
+    state.results = list; state.shown = 0;
+    $("view").replaceChildren();
+    showMore();
   } catch {
     status.textContent = "Die Kartendatenbank ist gerade nicht erreichbar. Prüfe deine Internetverbindung und versuche es noch einmal.";
+  }
+}
+// Ergebnisse in Blöcken anzeigen, Preise werden pro Block nachgeladen
+function showMore() {
+  const items = state.results.slice(state.shown, state.shown + PAGE);
+  state.shown += items.length;
+  $("more")?.remove();
+  renderGrid(items, true);
+  if (state.shown < state.results.length) {
+    const b = document.createElement("button");
+    b.id = "more"; b.className = "btn ghost"; b.style.cssText = "width:100%;margin-top:14px";
+    b.textContent = `Weitere ${Math.min(PAGE, state.results.length - state.shown)} von ${state.results.length - state.shown} laden`;
+    b.onclick = showMore;
+    $("view").appendChild(b);
   }
 }
 /* ---------- Merkliste mit Preis-Tracking ---------- */
@@ -306,7 +413,8 @@ let watchRefresh = null;
 function refreshWatch() {
   watchRefresh = watchRefresh || Promise.all(watch.map(async w => {
     const c = await getCard(w.id, w.lang);
-    return recordPoint(w, c?.pricing?.cardmarket);
+    const fill = c?.set?.name && !w.set ? (w.set = c.set.name, true) : false;
+    return recordPoint(w, c?.pricing?.cardmarket) || fill;
   })).then(r => { if (r.some(Boolean)) store.set("watch", watch); watchRefresh = null; return r.some(Boolean); });
   return watchRefresh;
 }
@@ -357,6 +465,7 @@ function renderWatch() {
     const b = document.createElement("button"); b.className = "entry wrow"; b.type = "button";
     b.innerHTML = `<img alt="" loading="lazy" src="${esc(img(w.image, "low"))}">
       <div class="mid"><div class="name">${esc(w.name)}</div>
+        <div class="chips"><span class="chip lang-chip">${esc(LANGS[w.cardLang || w.lang] ?? w.cardLang)}</span>${w.set ? `<span class="chip">${esc(w.set)} · ${esc(w.localId ?? "")}</span>` : ""}</div>
         <div class="meta">gemerkt ${w.addedAt ? "am " + fmtDate(w.addedAt) : "heute"} · ${t.start ? eur(t.start) : "–"}</div>
         ${sparkSvg(w.history)}</div>
       <div class="right"><div class="now">${eur(t.now)}</div>
@@ -422,16 +531,18 @@ function openWatchSheet(i) {
     <div class="row">
       <img alt="${esc(w.name)}" src="${esc(img(w.image, "high"))}" style="width:30%">
       <div><h2>${esc(w.name)}</h2>
-        <div class="meta">Nr. ${esc(w.localId ?? "")}</div>
+        <div class="meta">${esc(w.set ? w.set + " · " : "")}Nr. ${esc(w.localId ?? "")}</div>
+        <div class="chips" style="margin-top:4px"><span class="chip lang-chip">${esc(LANGS[w.cardLang || w.lang] ?? w.cardLang)}</span></div>
         <div class="wnow">${eur(t.now)}</div>
         <div class="dir ${t.dir}" style="font-weight:700">${DIR[t.dir].arrow} ${t.dir === "none" ? "" : pct(t.ch) + " · "}${DIR[t.dir].label}</div></div>
     </div>
     <p class="note" style="font-size:13px">${sentence}</p>
+    <p class="note">Hinweis: Cardmarket liefert einen gemeinsamen Preis für alle Sprachen. Die deutsche und die englische Version zeigen daher denselben Verlauf; die Sprache hilft dir beim Unterscheiden und führt beim Cardmarket-Button direkt zu Angeboten in dieser Sprache.</p>
     ${h.length ? `<div class="chartbox"><div class="tip" hidden></div>${chartSvg(h, t.start)}</div><p class="note" style="margin-top:4px">Gestrichelte Linie: Preis beim Merken. ${h.length} Messpunkte, einer pro Tag, an dem du die App geöffnet hast.</p>` : ""}
     <table>${rows.map(([k, v]) => `<tr><td>${k}</td><td>${eur(v)}</td></tr>`).join("")}</table>
     <div class="actions">
       <button class="btn ghost" id="w-card">Kartendetails und Sammlung</button>
-      <a class="btn ghost" target="_blank" rel="noopener" href="${cmUrl(w.name)}">Angebote auf Cardmarket (DE/EN, Near Mint)</a>
+      <a class="btn ghost" target="_blank" rel="noopener" href="${cmUrl(w.name, w.cardLang || w.lang)}">Angebote auf Cardmarket (${esc(LANGS[w.cardLang || w.lang])}, Near Mint)</a>
       <button class="btn danger" id="w-del">Von Merkliste entfernen</button>
     </div>`);
   wireChart($("sheet"), h);
@@ -580,7 +691,8 @@ async function openCardSheet(id, lang) {
     ["Ø 7 Tage", cm.avg7], ["Ø 30 Tage", cm.avg30],
     ["Ab-Preis Holo/Reverse", cm["low-holo"]], ["Trend Holo/Reverse", cm["trend-holo"]],
   ].filter(([, v]) => num(v)) : [];
-  const saved = watch.some(w => w.id === c.id && w.lang === lang);
+  const defLang = lang === "en" ? "en" : "de";
+  const isSaved = (cl) => watch.some(w => w.id === c.id && (w.cardLang || w.lang) === cl);
   const owned = coll.filter(e => e.id === c.id).reduce((s, e) => s + e.qty, 0);
   showSheet(`
     <button class="close" aria-label="Schließen">×</button>
@@ -601,8 +713,13 @@ async function openCardSheet(id, lang) {
     </fieldset>
     <div class="actions">
       <a class="btn ghost" target="_blank" rel="noopener" href="${cmUrl(c.name)}">Angebote auf Cardmarket (DE/EN, Near Mint)</a>
-      <button class="btn ghost" id="save">${saved ? "Von Merkliste entfernen" : "Merken"}</button>
-    </div>`);
+    </div>
+    <fieldset class="add"><legend>Merkliste</legend>
+      <div class="fields"><label style="grid-column:1/-1">Sprache der Karte<select id="w-lang">${Object.entries(LANGS).map(([k, v]) => `<option value="${k}"${k === defLang ? " selected" : ""}>${esc(v)}</option>`).join("")}</select></label></div>
+      <button class="btn ghost" id="save"></button>
+    </fieldset>`);
+  const saveLabel = () => { const cl = $("w-lang").value; $("save").textContent = isSaved(cl) ? `${LANGS[cl]}e Version von Merkliste entfernen` : `${LANGS[cl]}e Version merken`; };
+  $("w-lang").addEventListener("input", saveLabel); saveLabel();
   wireForm(cm);
   $("add").onclick = () => {
     const v = readForm();
@@ -613,10 +730,11 @@ async function openCardSheet(id, lang) {
     toast(`${v.qty}× ${c.name} zur Sammlung hinzugefügt`);
   };
   $("save").onclick = () => {
-    if (saved) watch = watch.filter(w => !(w.id === c.id && w.lang === lang));
-    else { const w = { id: c.id, lang, name: c.name, image: c.image, localId: c.localId, addedAt: today(), history: [] }; recordPoint(w, cm); watch.push(w); }
+    const cl = $("w-lang").value, saved = isSaved(cl);
+    if (saved) watch = watch.filter(w => !(w.id === c.id && (w.cardLang || w.lang) === cl));
+    else { const w = { id: c.id, lang, cardLang: cl, name: c.name, image: c.image, localId: c.localId, set: c.set?.name, addedAt: today(), history: [] }; recordPoint(w, cm); watch.push(w); }
     store.set("watch", watch); closeSheet();
-    toast(saved ? "Von Merkliste entfernt" : "Gemerkt. Der Preis wird ab heute verfolgt.");
+    toast(saved ? "Von Merkliste entfernt" : `${LANGS[cl]}e Version gemerkt. Der Preis wird ab heute verfolgt.`);
     if (state.view === "watch") renderWatch();
   };
 }
@@ -659,7 +777,7 @@ function setLang(l) {
   state.lang = l; store.set("lang", l);
   $("lang-de").setAttribute("aria-pressed", l === "de");
   $("lang-en").setAttribute("aria-pressed", l === "en");
-  $("q").placeholder = l === "de" ? "Kartenname, z. B. Glurak" : "Card name, e.g. Charizard";
+  $("q").placeholder = l === "de" ? "Kartenname, z. B. Glurak 30c" : "Card name, e.g. Charizard 30c";
   if (state.view === "search" && state.query) search(state.query);
 }
 async function setView(v) {
