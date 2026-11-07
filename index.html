@@ -404,12 +404,16 @@ function recordPoint(w, cm) {
   if (!cm) return false;
   if (num(cm.avg7)) w.avg7 = cm.avg7;
   if (num(cm.avg30)) w.avg30 = cm.avg30;
-  const p = marketPrice(cm, "normal");
-  if (!p) return false;
+  // Verfolgt wird der Cardmarket-Ab-Preis (günstigstes Angebot); der Trendpreis wird mitgespeichert.
+  // Ein selbst eingetragener Preis (own) hat Vorrang vor beiden.
+  const low = num(cm.low) ?? num(cm["low-holo"]), trend = marketPrice(cm, "normal");
+  if (!low && !trend) return false;
   w.history = w.history || [];
   const d = today(), last = w.history[w.history.length - 1];
-  if (last && last.d === d) { if (last.p === p) return false; last.p = p; }
-  else w.history.push({ d, p });
+  if (last && last.d === d) {
+    if (last.low === low && last.trend === trend) return false;
+    last.low = low; last.trend = trend; last.p = last.own ?? low ?? trend;
+  } else w.history.push({ d, low, trend, p: low ?? trend });
   if (!w.addedAt) w.addedAt = w.history[0].d;
   return true;
 }
@@ -462,7 +466,7 @@ function renderWatch() {
       <div><span class="big">${n("down")}</span><span class="lbl"><span class="dir down">▼</span> günstiger</span></div>
       <div><span class="big">${n("flat")}</span><span class="lbl"><span class="dir flat">■</span> stabil</span></div>
     </div>
-    <p class="note" style="margin:8px 0 14px">Veränderung seit du die Karte gemerkt hast, gemessen am Cardmarket-Trendpreis. Solange es nur einen Messpunkt gibt, zeigt die Tendenz den Cardmarket-Schnitt der letzten 7 gegen 30 Tage.</p>
+    <p class="note" style="margin:8px 0 14px">Veränderung seit du die Karte gemerkt hast, gemessen am Cardmarket-ab-Preis (günstigstes Angebot über alle Sprachen und Zustände) oder an deinen selbst eingetragenen Preisen. Solange es nur einen Messpunkt gibt, zeigt die Tendenz den Cardmarket-Schnitt der letzten 7 gegen 30 Tage.</p>
     <div class="list" id="wl"></div>`;
   const list = $("wl");
   watch.map((w, i) => ({ w, t: ts[i], i })).sort((a, b) => Math.abs(b.t.ch) - Math.abs(a.t.ch)).forEach(({ w, t, i }) => {
@@ -493,6 +497,7 @@ function chartSvg(h, start) {
     ${ticks.map(v => `<line x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}" stroke="var(--line)" stroke-width="1"/><text x="${W - R + 6}" y="${y(v) + 4}" font-size="11" fill="var(--muted)">${eur(v)}</text>`).join("")}
     ${start ? `<line x1="${L}" x2="${W - R}" y1="${y(start)}" y2="${y(start)}" stroke="var(--muted)" stroke-dasharray="4 4" stroke-width="1"/>` : ""}
     ${h.length > 1 ? `<polygon points="${x(h[0].d)},${H - B} ${pts} ${x(last.d)},${H - B}" fill="var(--bar)" opacity=".12"/><polyline points="${pts}" fill="none" stroke="var(--bar)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>` : ""}
+    ${h.filter(p => num(p.own)).map(p => `<circle cx="${x(p.d)}" cy="${y(p.p)}" r="5" fill="var(--surface)" stroke="var(--bar)" stroke-width="2"/>`).join("")}
     <circle cx="${x(last.d)}" cy="${y(last.p)}" r="4.5" fill="var(--bar)" stroke="var(--surface)" stroke-width="2"/>
     <text x="${L}" y="${H - 6}" font-size="11" fill="var(--muted)">${fmtDate(h[0].d)}</text>
     <text x="${W - R}" y="${H - 6}" font-size="11" fill="var(--muted)" text-anchor="end">${fmtDate(last.d)}</text>
@@ -511,7 +516,7 @@ function wireChart(box, h) {
     const [px, py] = pts[k];
     cross.setAttribute("x1", px); cross.setAttribute("x2", px); cross.setAttribute("visibility", "visible");
     hov.setAttribute("cx", px); hov.setAttribute("cy", py); hov.setAttribute("visibility", "visible");
-    tip.hidden = false; tip.textContent = `${fmtDate(h[k].d)}: ${eur(h[k].p)}`;
+    tip.hidden = false; tip.textContent = `${fmtDate(h[k].d)}: ${eur(h[k].p)}${num(h[k].own) ? " (dein Preis)" : ""}`;
     tip.style.left = Math.min(Math.max(px / 340 * r.width - 50, 0), r.width - 110) + "px";
   };
   const hide = () => { tip.hidden = true; cross.setAttribute("visibility", "hidden"); hov.setAttribute("visibility", "hidden"); };
@@ -520,9 +525,12 @@ function wireChart(box, h) {
 function openWatchSheet(i) {
   const w = watch[i]; if (!w) return;
   const t = trendOf(w), h = w.history || [];
-  const ps = h.map(x => x.p);
+  const ps = h.map(x => x.p), lastPt = h[h.length - 1] || {};
+  const lastOwn = [...h].reverse().find(x => num(x.own));
   const rows = [
-    ["Preis beim Merken" + (w.addedAt ? ` (${fmtDate(w.addedAt)})` : ""), t.start], ["Aktueller Trendpreis", t.now],
+    ["Preis beim Merken" + (w.addedAt ? ` (${fmtDate(w.addedAt)})` : ""), t.start],
+    ["Cardmarket ab-Preis (alle Sprachen/Zustände)", lastPt.low], ["Cardmarket Trendpreis", lastPt.trend ?? (lastPt.low == null ? lastPt.p : null)],
+    [lastOwn ? `Dein eingetragener Preis (${fmtDate(lastOwn.d)})` : "", lastOwn?.own],
     ["Höchster Preis seitdem", ps.length ? Math.max(...ps) : null], ["Tiefster Preis seitdem", ps.length ? Math.min(...ps) : null],
     ["Cardmarket Ø 7 Tage", w.avg7], ["Cardmarket Ø 30 Tage", w.avg30]
   ].filter(([, v]) => num(v));
@@ -541,16 +549,42 @@ function openWatchSheet(i) {
         <div class="dir ${t.dir}" style="font-weight:700">${DIR[t.dir].arrow} ${t.dir === "none" ? "" : pct(t.ch) + " · "}${DIR[t.dir].label}</div></div>
     </div>
     <p class="note" style="font-size:13px">${sentence}</p>
-    <p class="note">Hinweis: Cardmarket liefert einen gemeinsamen Preis für alle Sprachen. Die deutsche und die englische Version zeigen daher denselben Verlauf; die Sprache hilft dir beim Unterscheiden und führt beim Cardmarket-Button direkt zu Angeboten in dieser Sprache.</p>
-    ${h.length ? `<div class="chartbox"><div class="tip" hidden></div>${chartSvg(h, t.start)}</div><p class="note" style="margin-top:4px">Gestrichelte Linie: Preis beim Merken. ${h.length} Messpunkte, einer pro Tag, an dem du die App geöffnet hast.</p>` : ""}
-    <table>${rows.map(([k, v]) => `<tr><td>${k}</td><td>${eur(v)}</td></tr>`).join("")}</table>
+    ${h.length ? `<div class="chartbox"><div class="tip" hidden></div>${chartSvg(h, t.start)}</div><p class="note" style="margin-top:4px">Gestrichelte Linie: Preis beim Merken. Ringe: von dir eingetragene Preise. Sonst automatisch der Cardmarket-ab-Preis, ein Punkt pro Tag, an dem du die App öffnest.</p>` : ""}
+    <table>${rows.filter(([k, v]) => k && num(v)).map(([k, v]) => `<tr><td>${k}</td><td>${eur(v)}</td></tr>`).join("")}</table>
+    <fieldset class="add"><legend>Preis selbst eintragen</legend>
+      <p class="note" style="margin:0">Cardmarket liefert keinen eigenen Preis für ${esc(LANGS[w.cardLang || w.lang])} und Near Mint. Trag den günstigsten passenden Preis ein, den du auf Cardmarket siehst. Er zählt als Messpunkt für heute.</p>
+      <div class="fields"><label style="grid-column:1/-1">Preis ${esc(LANGS[w.cardLang || w.lang])}, Near Mint (€)<input id="w-own" type="text" inputmode="decimal" placeholder="z. B. 57,90" value="${num(lastPt.own) && lastPt.d === today() ? String(lastPt.own).replace(".", ",") : ""}"></label></div>
+      <button class="btn" id="w-own-save">Preis für heute speichern</button>
+    </fieldset>
+    <fieldset class="add"><legend>Cardmarket-Link</legend>
+      <div class="fields"><label style="grid-column:1/-1">Link zur Karte auf Cardmarket (optional)<input id="w-link" type="url" inputmode="url" placeholder="https://www.cardmarket.com/de/Pokemon/Products/Singles/…" value="${esc(w.cmLink || "")}"></label></div>
+      <button class="btn ghost" id="w-link-save">Link speichern</button>
+    </fieldset>
     <div class="actions">
       <button class="btn ghost" id="w-card">Kartendetails und Sammlung</button>
-      <a class="btn ghost" target="_blank" rel="noopener" href="${cmUrl(w.name, w.cardLang || w.lang)}">Angebote auf Cardmarket (${esc(LANGS[w.cardLang || w.lang])}, Near Mint)</a>
+      <a class="btn ghost" target="_blank" rel="noopener" href="${esc(w.cmLink || cmUrl(w.name, w.cardLang || w.lang))}">${w.cmLink ? "Karte auf Cardmarket öffnen" : `Angebote auf Cardmarket (${esc(LANGS[w.cardLang || w.lang])}, Near Mint)`}</a>
       <button class="btn danger" id="w-del">Von Merkliste entfernen</button>
     </div>`);
   wireChart($("sheet"), h);
   $("w-card").onclick = () => openCardSheet(w.id, w.lang);
+  $("w-own-save").onclick = () => {
+    const v = num(parseFloat(($("w-own").value || "").replace(/\./g, "").replace(",", ".")));
+    w.history = w.history || [];
+    const d = today(); let pt = w.history[w.history.length - 1];
+    if (!pt || pt.d !== d) { pt = { d }; w.history.push(pt); }
+    if (v) pt.own = v; else delete pt.own;
+    pt.p = pt.own ?? pt.low ?? pt.trend;
+    if (pt.p == null) w.history.pop();
+    if (!w.addedAt && w.history.length) w.addedAt = w.history[0].d;
+    store.set("watch", watch); toast(v ? `${eur(v)} für heute gespeichert` : "Eigener Preis entfernt");
+    openWatchSheet(watch.indexOf(w)); if (state.view === "watch") renderWatch();
+  };
+  $("w-link-save").onclick = () => {
+    const v = $("w-link").value.trim();
+    if (v && !/^https:\/\/(www\.)?cardmarket\.com\//i.test(v)) { toast("Bitte einen Link von cardmarket.com einfügen"); return; }
+    if (v) w.cmLink = v; else delete w.cmLink;
+    store.set("watch", watch); toast(v ? "Link gespeichert" : "Link entfernt"); openWatchSheet(watch.indexOf(w));
+  };
   let armed = false;
   $("w-del").onclick = () => {
     if (!armed) { armed = true; $("w-del").textContent = "Wirklich entfernen? Der Verlauf geht verloren. Nochmal tippen"; return; }
