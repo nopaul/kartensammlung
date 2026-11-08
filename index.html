@@ -326,6 +326,14 @@ async function officialCodes(lang) {
   if (Object.keys(m).length) store.set(key, { t: Date.now(), m });
   return m;
 }
+// Ein Set und seine Teil-Sets: gleicher Namensanfang („X: Classic Collection“) oder gleiche ID mit Zusatz („me55“ / „me55c“)
+async function setGroup(set) {
+  const all = await allSets();
+  if (String(set.name).includes(":")) return [set]; // ein ausgewähltes Teil-Set bleibt für sich
+  const base = norm(set.name);
+  const g = all.filter(s => s.id === set.id || (base.length > 3 && norm(s.name.split(":")[0]) === base) || (s.id.startsWith(set.id) && /^[a-z]$/i.test(s.id.slice(set.id.length))));
+  return g.length ? g : [set];
+}
 async function findSet(token, lang, deep) {
   const t = norm(token); if (!t || t.length < 2) return null;
   const sets = await getSets(lang);
@@ -473,7 +481,12 @@ async function search(q) {
     }
     let coverage = "";
     if (set) {
-      const cards = await setCards(set.id);
+      // Teil-Sets mitnehmen, z. B. „30th Celebration“ + „30th Celebration: Classic Collection“ (beide Kürzel 30C)
+      const group = await setGroup(set);
+      const parts = await Promise.all(group.map(g => setCards(g.id)));
+      const ok = parts.filter(Boolean);
+      const cards = ok.length ? Object.assign(mergeById(ok.flat(), []), { total: ok.reduce((t, x) => t + (x.total || 0), 0) }) : null;
+      if (group.length > 1) set = { ...set, name: set.name + " inkl. " + group.filter(g => g.id !== set.id).map(g => g.name.split(":").pop().trim()).join(", ") };
       if (!cards) throw new Error("set");
       if (!cards.length) { status.textContent = `Für das Set ${set.name} enthält die Kartendatenbank noch keine Karten, weder auf Deutsch noch auf Englisch.`; $("view").innerHTML = ""; return; }
       if (cards.total && cards.length < cards.total) coverage = ` Hinweis: Die Kartendatenbank enthält von diesem Set bisher erst ${cards.length} von ${cards.total} Karten.`;
