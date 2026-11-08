@@ -944,6 +944,7 @@ async function openCardSheet(id, lang, preferLang) {
         <div class="meta">${esc(c.set?.name ?? "")} · Nr. ${esc(c.localId)}${c.set?.cardCount?.official ? "/" + c.set.cardCount.official : ""}</div>
         <div class="meta">${esc(c.rarity ?? "")}</div>
         ${owned ? `<div class="meta"><strong>${owned}× in deiner Sammlung</strong></div>` : ""}
+        ${preferLang && LANGS[preferLang] ? `<div class="chips" style="margin-top:4px"><span class="chip lang-chip">Erkannt: ${esc(LANGS[preferLang])}</span></div>${["de", "en"].includes(lang) && preferLang !== lang ? `<div class="meta">Die Datenbank hat diese Karte nur auf ${esc(LANGS[lang])}. Gespeichert wird sie als ${esc(LANGS[preferLang].toLowerCase())}e Karte.</div>` : ""}` : ""}
       </div>
     </div>
     ${rows.length ? `<table>${rows.map(([k, v]) => `<tr><td>${k}</td><td>${eur(v)}</td></tr>`).join("")}</table>` : `<p class="note">Für diese Karte liegen keine Cardmarket-Preise vor.</p>`}
@@ -1086,13 +1087,8 @@ function parseCardText(text) {
     const m = text.match(/\b(SVP|SWSH|SM|XY|BW|MEP)\s?([0-9]{2,3})\b/);
     if (m) { r.code = m[1]; r.number = m[2]; }
   }
-  // Sprache aus der KP/HP-Angabe: KP = Deutsch, PV = Französisch/Italienisch, PS = Spanisch, HP = Englisch
-  if (!r.lang) {
-    if (/\bKP\s*\d/.test(text)) r.lang = "de";
-    else if (/\bPV\s*\d/.test(text)) r.lang = "fr";
-    else if (/\bPS\s*\d/.test(text)) r.lang = "es";
-    else if (/\bHP\s*\d/.test(text)) r.lang = "en";
-  }
+  r.numLang = r.lang; // Sprachkennung direkt neben der Nummer (sicherstes Merkmal)
+  r.lang = detectLang(text, r.numLang);
   // Name: Text vor der KP/HP-Angabe, sonst erste sinnvolle Zeile
   const skip = /^(BASIS|BASIC|PHASE|STAGE|STUFE|BASE|ENTWICKLUNG|TRAINER|ENERGIE|ENERGY|ITEM|ARTIKEL|UNTERSTÜTZUNG|SUPPORTER)\b/i;
   const hpLine = lines.find(l => /\b(KP|HP|PV|PS)\s*\d{2,3}/.test(l));
@@ -1100,6 +1096,33 @@ function parseCardText(text) {
   name = name.replace(skip, "").replace(/[^A-Za-zÄÖÜäöüß0-9\-\s'.]/g, " ").replace(/\s+/g, " ").trim();
   r.name = name.split(" ").slice(0, 4).join(" ");
   return r;
+}
+// Sprache der Karte aus mehreren Merkmalen: Kennung neben der Nummer, KP/HP/PV/PS und typische Wörter des Kartentexts
+const LANG_WORDS = {
+  de: /\b(schwäche|schwache|resistenz|rückzug|ruckzug|entwickelt|phase|basis|lege|deines|deinen|deiner|gegners|gegnerische|schaden|karte|karten|ablagestapel|münze|munze|wirf|zieh|jede|diesem|dieses|wenn|auf|und|der|die|das|ein|eine|nicht)\b/gi,
+  en: /\b(weakness|resistance|retreat|evolves|stage|basic|your|opponent|opponent's|damage|attach|discard|flip|coin|draw|each|this|if|and|the|from|does|pile|hand)\b/gi,
+  fr: /\b(faiblesse|résistance|retraite|niveau|votre|adverse|dégâts|defausse|défausse|pièce|piochez|attaque)\b/gi,
+  it: /\b(debolezza|resistenza|ritirata|fase|tuo|avversario|danni|scarta|moneta|pesca)\b/gi,
+  es: /\b(debilidad|resistencia|retirada|fase|tu|rival|daño|descarta|moneda|roba)\b/gi
+};
+function detectLang(text, numLang) {
+  const sc = { de: 0, en: 0, fr: 0, it: 0, es: 0 };
+  if (numLang && sc[numLang] !== undefined) sc[numLang] += 6;
+  if (/\bKP\s*\d/.test(text)) sc.de += 4;
+  if (/\bHP\s*\d/.test(text)) sc.en += 3;
+  if (/\bPV\s*\d/.test(text)) { sc.fr += 2; sc.it += 2; }
+  if (/\bPS\s*\d/.test(text)) sc.es += 3;
+  for (const [l, re] of Object.entries(LANG_WORDS)) sc[l] += Math.min(8, (text.match(re) || []).length);
+  sc.de += Math.min(3, (text.match(/[äöüßÄÖÜ]/g) || []).length * 0.5);
+  const best = Object.entries(sc).sort((a, b) => b[1] - a[1]);
+  return best[0][1] >= 2 && best[0][1] > best[1][1] ? best[0][0] : (numLang || "");
+}
+// Öffnet eine erkannte Karte in der erkannten Sprache, wenn die Datenbank diese Version hat
+async function openScanned(c, f) {
+  const want = ["de", "en"].includes(f?.lang) ? f.lang : null;
+  let lang = c.lang || state.lang;
+  if (want && want !== lang && await getCard(c.id, want)) lang = want;
+  openCardSheet(c.id, lang, f?.lang || null);
 }
 // Zeilen mit Position, Schrifthöhe und Erkennungssicherheit aus dem Tesseract-Ergebnis
 function ocrLines(data) {
@@ -1211,7 +1234,7 @@ function renderScan() {
   };
   if (scan.cands?.length) {
     const grid = $("s-grid");
-    scan.cands.forEach(c => { const t = cardTile(c, null); t.onclick = () => openCardSheet(c.id, c.lang || state.lang, scan.fields?.lang); grid.appendChild(t);
+    scan.cands.forEach(c => { const t = cardTile(c, null); t.onclick = () => openScanned(c, scan.fields); grid.appendChild(t);
       getCard(c.id, c.lang || state.lang).then(full => { if (full && document.contains(t)) { const n = cardTile(c, full); n.onclick = t.onclick; t.replaceWith(n); } }); });
   }
 }
@@ -1235,7 +1258,7 @@ async function runScan(file) {
     const names = [...nameFromLines(ocrLines(top.data), topCanvas.height, false), ...nameFromLines(ocrLines(full.data), fullCanvas.height, true)];
     f.names = [...new Set(names)].slice(0, 4);
     if (f.names.length) f.name = f.names[0];
-    if (!f.lang) f.lang = parseCardText(top.data.text).lang;
+    f.lang = detectLang(top.data.text + "\n" + full.data.text, f.numLang);
     if (!f.number) { // zweiter Versuch: unteres Drittel vergrößert, dort stehen Nummer und Setkürzel
       const bottom = await w.recognize(await imageCanvas(file, 0.35));
       const b = parseCardText(bottom.data.text);
@@ -1256,6 +1279,8 @@ async function runIdentify(fromPhoto) {
   scan.msg = "Suche die Karte in der Datenbank…"; renderScan();
   try {
     const list = await identifyCard(f);
+    const want = ["de", "en"].includes(f.lang) ? f.lang : null;
+    if (want) await Promise.all(list.slice(0, 12).map(async c => { if (c.lang !== want) { const v = await getCard(c.id, want); if (v) { c.lang = want; c.name = v.name; c.image = v.image || c.image; } } }));
     scan.cands = list;
     const sure = list.length === 1 || (list.length > 1 && list[0].score >= 1.6 && list[1].score < list[0].score - 0.3);
     scan.msg = !list.length ? "Keine passende Karte gefunden. Prüf die erkannten Angaben unten und such erneut."
@@ -1263,7 +1288,7 @@ async function runIdentify(fromPhoto) {
       : "Die Angaben passen auf mehrere Karten. Tippe unten auf die richtige.";
     if (sure) { scan.cands = [list[0]]; f.name = list[0].name; }
     renderScan();
-    if (sure && fromPhoto && state.view === "scan") openCardSheet(list[0].id, list[0].lang || state.lang, f.lang);
+    if (sure && fromPhoto && state.view === "scan") openScanned(list[0], f);
   } catch {
     scan.msg = "Die Kartendatenbank ist gerade nicht erreichbar. Versuch es gleich noch einmal."; renderScan();
   }
