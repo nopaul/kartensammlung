@@ -1078,74 +1078,230 @@ async function openEntrySheet(uid) {
 
 /* ---------- Karten-Scan per Foto ---------- */
 // Texterkennung (Tesseract) läuft komplett auf dem Gerät; Skript und Sprachdaten werden beim ersten Scan geladen.
+// Ablauf: Foto geraderichten -> Karte im Bild finden -> Name (oben) und Nummer/Setkürzel (unten) gezielt vergrößert lesen
+// -> mit der ganzen Kartendatenbank abgleichen (Nummer, Gesamtzahl, Kürzel, Name, Attackennamen, KP).
 const TESS_SRC = "https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js";
 let tessWorker = null;
 const scan = { img: null, fields: null, cands: null, msg: "", busy: false, text: "" };
 function loadScript(src) {
   return new Promise((res, rej) => { const s = document.createElement("script"); s.src = src; s.onload = res; s.onerror = () => rej(new Error("script")); document.head.appendChild(s); });
 }
+// Nur einen Tesseract-Worker anlegen, auch wenn das Vorladen beim Öffnen des Tabs noch läuft
+let tessPromise = null, tessProgress = null;
 async function getTess(onProgress) {
+  if (onProgress) tessProgress = onProgress;
   if (tessWorker) return tessWorker;
-  if (!window.Tesseract) await loadScript(TESS_SRC);
-  tessWorker = await Tesseract.createWorker(["eng", "deu"], 1, {
-    logger: m => { if (m.status && typeof m.progress === "number") onProgress?.(m.status, m.progress); }
-  });
-  return tessWorker;
+  if (!tessPromise) tessPromise = (async () => {
+    if (!window.Tesseract) await loadScript(TESS_SRC);
+    tessWorker = await Tesseract.createWorker(["eng", "deu"], 1, {
+      logger: m => { if (m.status && typeof m.progress === "number") tessProgress?.(m.status, m.progress); }
+    });
+    return tessWorker;
+  })().catch(e => { tessPromise = null; throw e; });
+  return tessPromise;
 }
-// Foto verkleinern (und optional nur einen Ausschnitt vergrößern) für die Texterkennung
-async function imageCanvas(file, crop) {
-  const bmp = await createImageBitmap(file);
-  const maxW = crop ? 2400 : 1800;
-  // crop > 0: unterer Anteil des Bildes, crop < 0: oberer Anteil
-  const sx = 0, sy = crop > 0 ? Math.round(bmp.height * (1 - crop)) : 0, sw = bmp.width, sh = crop ? Math.round(bmp.height * Math.abs(crop)) : bmp.height;
-  const scale = Math.min(1, maxW / sw) * (crop ? 1.6 : 1);
+async function ocr(w, canvas, psm) {
+  await w.setParameters({ tessedit_pageseg_mode: String(psm || 3) });
+  const r = await w.recognize(canvas);
+  return r.data;
+}
+
+/* --- Bild vorbereiten --- */
+// Foto laden (Ausrichtung aus den Kameradaten beachten) und auf eine handliche Größe bringen
+async function loadPhoto(file) {
+  let src, url = null;
+  try {
+    url = URL.createObjectURL(file);
+    src = await new Promise((res, rej) => { const im = new Image(); im.onload = () => res(im); im.onerror = rej; im.src = url; });
+  } catch { src = await createImageBitmap(file); }
+  const w0 = src.naturalWidth || src.width, h0 = src.naturalHeight || src.height;
+  const s = Math.min(1, 2600 / Math.max(w0, h0));
   const c = document.createElement("canvas");
-  c.width = Math.round(sw * scale); c.height = Math.round(sh * scale);
-  const g = c.getContext("2d");
-  g.filter = "grayscale(1) contrast(1.35)";
-  g.drawImage(bmp, sx, sy, sw, sh, 0, 0, c.width, c.height);
+  c.width = Math.round(w0 * s); c.height = Math.round(h0 * s);
+  c.getContext("2d").drawImage(src, 0, 0, c.width, c.height);
+  src.close?.(); if (url) URL.revokeObjectURL(url);
   return c;
 }
+function rotate90(base) {
+  const c = document.createElement("canvas"); c.width = base.height; c.height = base.width;
+  const g = c.getContext("2d"); g.translate(c.width, 0); g.rotate(Math.PI / 2); g.drawImage(base, 0, 0);
+  return c;
+}
+function grayOf(canvas, maxSide) {
+  const s = Math.min(1, maxSide / Math.max(canvas.width, canvas.height));
+  const w = Math.max(1, Math.round(canvas.width * s)), h = Math.max(1, Math.round(canvas.height * s));
+  const c = document.createElement("canvas"); c.width = w; c.height = h;
+  const g = c.getContext("2d", { willReadFrequently: true }); g.drawImage(canvas, 0, 0, w, h);
+  const d = g.getImageData(0, 0, w, h).data, out = new Float32Array(w * h);
+  for (let i = 0; i < w * h; i++) out[i] = 0.299 * d[i * 4] + 0.587 * d[i * 4 + 1] + 0.114 * d[i * 4 + 2];
+  return { g: out, w, h, s };
+}
+// Schräglage schätzen: Kanten (Schrift, Kartenrand) auf Zeilen projizieren; beim richtigen Winkel ergeben sich die schärfsten Spitzen
+function estimateSkew(canvas) {
+  const { g, w, h } = grayOf(canvas, 640);
+  const pts = [];
+  for (let y = 1; y < h - 1; y++) for (let x = 1; x < w - 1; x++) {
+    const i = y * w + x, gx = g[i + 1] - g[i - 1], gy = g[i + w] - g[i - w];
+    if (gx * gx + gy * gy > 1600) pts.push(x - w / 2, y - h / 2);
+  }
+  if (pts.length < 200) return 0;
+  const n = Math.ceil(Math.hypot(w, h)) + 4, bins = new Float32Array(n);
+  let best = 0, bestScore = -1;
+  for (let a = -20; a <= 20; a += 0.5) {
+    const r = a * Math.PI / 180, sn = Math.sin(r), cs = Math.cos(r);
+    bins.fill(0);
+    for (let k = 0; k < pts.length; k += 2) { const v = -pts[k] * sn + pts[k + 1] * cs + n / 2; bins[v | 0]++; }
+    let sc = 0; for (let k = 0; k < n; k++) sc += bins[k] * bins[k];
+    if (sc > bestScore) { bestScore = sc; best = a; }
+  }
+  return best;
+}
+// Ausschnitt des geradegerichteten Bildes rendern (Koordinaten im gedrehten Bild), vergrößert und kontrastverstärkt
+function rotatedSize(base, angle) {
+  const r = Math.abs(angle) * Math.PI / 180;
+  return { W: Math.ceil(base.width * Math.cos(r) + base.height * Math.sin(r)), H: Math.ceil(base.width * Math.sin(r) + base.height * Math.cos(r)) };
+}
+function renderRegion(base, angle, rect, scale, opts = {}) {
+  const { W, H } = rotatedSize(base, angle);
+  const x = Math.max(0, rect.x), y = Math.max(0, rect.y);
+  const w = Math.min(W - x, rect.w + Math.min(0, rect.x)), h = Math.min(H - y, rect.h + Math.min(0, rect.y));
+  const c = document.createElement("canvas");
+  c.width = Math.max(8, Math.round(w * scale)); c.height = Math.max(8, Math.round(h * scale));
+  const g = c.getContext("2d", { willReadFrequently: true });
+  g.fillStyle = "#fff"; g.fillRect(0, 0, c.width, c.height);
+  g.setTransform(scale, 0, 0, scale, -x * scale, -y * scale);
+  g.translate(W / 2, H / 2); g.rotate(-angle * Math.PI / 180);
+  g.drawImage(base, -base.width / 2, -base.height / 2);
+  g.setTransform(1, 0, 0, 1, 0, 0);
+  // Graustufen, Kontrast und ggf. Umkehrung selbst rechnen (Canvas-Filter gibt es nicht in jedem Safari)
+  const im = g.getImageData(0, 0, c.width, c.height), d = im.data, k = opts.contrast || 1.35;
+  for (let i = 0; i < d.length; i += 4) {
+    let v = (0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2] - 128) * k + 128;
+    if (opts.invert) v = 255 - v;
+    d[i] = d[i + 1] = d[i + 2] = v < 0 ? 0 : v > 255 ? 255 : v;
+  }
+  g.putImageData(im, 0, 0);
+  return c;
+}
+const meanLum = (c) => { const { g } = grayOf(c, 200); let s = 0; for (const v of g) s += v; return s / g.length; };
+// Schärfen (Unschärfemaske mit Radius passend zur Vergrößerung) und lokal binarisieren: hilft bei unscharfer, kleiner Schrift und Spiegelungen
+function boxMean(a, w, h, r) {
+  const I = new Float64Array((w + 1) * (h + 1)), out = new Float32Array(w * h);
+  for (let y = 0; y < h; y++) { let row = 0; for (let x = 0; x < w; x++) { row += a[y * w + x]; I[(y + 1) * (w + 1) + x + 1] = I[y * (w + 1) + x + 1] + row; } }
+  for (let y = 0; y < h; y++) { const y0 = Math.max(0, y - r), y1 = Math.min(h, y + r + 1);
+    for (let x = 0; x < w; x++) { const x0 = Math.max(0, x - r), x1 = Math.min(w, x + r + 1);
+      out[y * w + x] = (I[y1 * (w + 1) + x1] - I[y0 * (w + 1) + x1] - I[y1 * (w + 1) + x0] + I[y0 * (w + 1) + x0]) / ((x1 - x0) * (y1 - y0)); } }
+  return out;
+}
+function binarize(c, blurR = 2, threshold = true) {
+  const w = c.width, h = c.height, g = c.getContext("2d", { willReadFrequently: true });
+  const im = g.getImageData(0, 0, w, h), d = im.data, a = new Float32Array(w * h);
+  for (let i = 0; i < w * h; i++) a[i] = d[i * 4];
+  const bl = boxMean(a, w, h, Math.max(1, Math.round(blurR)));
+  const sh = new Float32Array(w * h);
+  for (let i = 0; i < w * h; i++) sh[i] = a[i] + 1.8 * (a[i] - bl[i]);
+  const m = threshold ? boxMean(sh, w, h, Math.max(10, Math.round(blurR * 6))) : null;
+  for (let i = 0; i < w * h; i++) {
+    const v = threshold ? (sh[i] < m[i] - 10 ? 0 : 255) : Math.max(0, Math.min(255, sh[i]));
+    d[i * 4] = d[i * 4 + 1] = d[i * 4 + 2] = v;
+  }
+  g.putImageData(im, 0, 0);
+  return c;
+}
+// Karte im geradegerichteten Bild finden: Rechteck im Kartenformat (63 x 88 mm), dessen Rand am besten auf durchgehenden Kanten liegt
+function findCard(base, angle) {
+  const { W, H } = rotatedSize(base, angle);
+  const s = 300 / Math.max(W, H);
+  const small = renderRegion(base, angle, { x: 0, y: 0, w: W, h: H }, s, { contrast: 1 });
+  const { g, w, h } = grayOf(small, 400);
+  // Bildrand nach dem Drehen ist keine Kartenkante: Maske des gültigen Bereichs (4 px eingerückt)
+  const mk = document.createElement("canvas"); mk.width = w; mk.height = h;
+  const mg = mk.getContext("2d", { willReadFrequently: true });
+  mg.fillStyle = "#000"; mg.fillRect(0, 0, w, h);
+  mg.setTransform(s, 0, 0, s, 0, 0); mg.translate(W / 2, H / 2); mg.rotate(-angle * Math.PI / 180);
+  mg.fillStyle = "#fff"; const ins = 5 / s; mg.fillRect(-base.width / 2 + ins, -base.height / 2 + ins, base.width - 2 * ins, base.height - 2 * ins);
+  const md = mg.getImageData(0, 0, w, h).data;
+  const valid = (i) => md[i * 4] > 250;
+  // binäre Kantenkarten: senkrechte Kanten (für linken/rechten Rand) und waagerechte (oben/unten), um 2 px verbreitert
+  const ev = new Uint8Array(w * h), eh = new Uint8Array(w * h);
+  for (let y = 1; y < h - 1; y++) for (let x = 1; x < w - 1; x++) {
+    const i = y * w + x;
+    if (!valid(i)) continue;
+    const gx = Math.abs(g[i + 1] - g[i - 1] + 0.5 * (g[i + 1 - w] - g[i - 1 - w] + g[i + 1 + w] - g[i - 1 + w]));
+    const gy = Math.abs(g[i + w] - g[i - w] + 0.5 * (g[i + w - 1] - g[i - w - 1] + g[i + w + 1] - g[i - w + 1]));
+    if (gx > 30 && gx > gy) for (let d = -2; d <= 2; d++) if (x + d >= 0 && x + d < w) ev[i + d] = 1;
+    if (gy > 30 && gy > gx) for (let d = -2; d <= 2; d++) if (y + d >= 0 && y + d < h) eh[i + d * w] = 1;
+  }
+  // Summen entlang Spalten bzw. Zeilen für schnelle Randabfragen
+  const cv = new Uint32Array(w * (h + 1)), ch = new Uint32Array(h * (w + 1));
+  for (let x = 0; x < w; x++) for (let y = 0; y < h; y++) cv[x * (h + 1) + y + 1] = cv[x * (h + 1) + y] + ev[y * w + x];
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) ch[y * (w + 1) + x + 1] = ch[y * (w + 1) + x] + eh[y * w + x];
+  const V = (x, y0, y1) => cv[x * (h + 1) + y1] - cv[x * (h + 1) + y0];
+  const Hs = (y, x0, x1) => ch[y * (w + 1) + x1] - ch[y * (w + 1) + x0];
+  let best = null;
+  for (const r of [0.66, 0.69, 0.716, 0.74, 0.77]) {
+    for (let cw = Math.round(w * 0.3); cw < w - 1; cw++) {
+      const chh = Math.round(cw / r); if (chh >= h - 1) break;
+      for (let y0 = 0; y0 + chh < h; y0 += 1) for (let x0 = 0; x0 + cw < w; x0 += 1) {
+        const sc = (V(x0, y0, y0 + chh) + V(x0 + cw, y0, y0 + chh) + Hs(y0, x0, x0 + cw) + Hs(y0 + chh, x0, x0 + cw)) / (2 * (cw + chh)) * (1 + 0.12 * cw / w);
+        if (!best || sc > best.sc) best = { sc, x0, y0, cw, chh };
+      }
+    }
+  }
+  if (!best || best.sc < 0.33) return null;
+  const k = 1 / (s * (w / small.width));
+  return { x: best.x0 * k, y: best.y0 * k, w: best.cw * k, h: best.chh * k, score: best.sc };
+}
+
+/* --- Text auswerten --- */
 const LANG_TOKENS = { EN: "en", DE: "de", FR: "fr", IT: "it", ES: "es", PT: "pt", JP: "ja", KO: "ko" };
-const fixDigits = (s) => s.replace(/[Oo]/g, "0").replace(/[Il|]/g, "1").replace(/S/g, "5").replace(/B/g, "8");
-// Liest aus dem erkannten Text Name, Kartennummer, Gesamtzahl, Setkürzel und Sprache
-function parseCardText(text) {
-  const lines = text.split(/\n+/).map(l => l.trim()).filter(Boolean);
-  const r = { name: "", number: "", total: "", code: "", lang: "" };
-  // Nummer wie „154/128“, „TG05/TG30“, „GG01/GG70“
-  for (const l of lines) {
-    const m = l.match(/\b([A-Z]{2})?([0-9OoIlSB|]{1,3})\s*\/\s*([A-Z]{2})?([0-9OoIlSB|]{2,3})\b/);
-    if (m) {
-      r.number = (m[1] || "") + fixDigits(m[2]); r.total = fixDigits(m[4]);
-      // Setkürzel und Sprachkennung stehen auf neueren Karten in derselben Zeile („30C DE 154/128“)
-      const before = l.slice(0, m.index).toUpperCase().split(/[^A-Z0-9]+/).filter(Boolean);
-      for (const t of before.reverse()) {
+const fixDigits = (s) => s.replace(/[Oo]/g, "0").replace(/[Il|!\]]/g, "1").replace(/S/g, "5").replace(/B/g, "8").replace(/Z/g, "2");
+const NUM_RE = /(TG|GG|SV|RC|SH|H)?([0-9OoIlSBZ|!\]]{1,3}) ?\/ ?(TG|GG|SV|RC|SH|H)?([0-9OoIlSBZ|!\]]{2,3})(?![0-9])/g;
+// Alle Kandidaten für „Nummer/Gesamtzahl“ mit Setkürzel und Sprachkennung derselben Zeile
+function numberCands(text, weight = 1) {
+  const out = [];
+  for (const raw of text.split(/\n+/)) {
+    const l = raw.trim(); if (!l) continue;
+    for (const m of l.matchAll(NUM_RE)) {
+      if (m.index > 0 && /\d/.test(l[m.index - 1])) continue;
+      const pre = (m[1] || "").toUpperCase(), number = pre + fixDigits(m[2]), total = fixDigits(m[4]);
+      if (!/^\d+$/.test(total) || +total < 5) continue;
+      const r = { number, total: String(+total), code: "", lang: "", w: weight };
+      let before = l.slice(0, m.index).toUpperCase().split(/[^A-Z0-9]+/).filter(Boolean);
+      if (before.some(t => /^ILLU/.test(t))) before = []; // „Illus. Ken Sugimori 58/132“: Zeichnername ist kein Setkürzel
+      for (let t of before.reverse()) {
+        const glued = t.match(/^([A-Z0-9]{2,4}?)(EN|DE|FR|IT|ES|PT)$/);
+        if (!r.lang && glued && /[A-Z]/.test(glued[1])) { r.lang = LANG_TOKENS[glued[2]]; if (!r.code) r.code = glued[1]; continue; }
         if (!r.lang && LANG_TOKENS[t]) { r.lang = LANG_TOKENS[t]; continue; }
         if (!r.code && /^[A-Z0-9]{2,4}$/.test(t) && /[A-Z]/.test(t) && !LANG_TOKENS[t] && !["HP", "KP", "PV", "PS"].includes(t)) r.code = t;
       }
-      break;
+      out.push(r);
     }
   }
+  if (!out.length) { // Schrägstrich nicht erkannt: „PAF DE 123091“ -> 123/091
+    const m = text.toUpperCase().match(/\b([A-Z0-9]{2,4})?\s?(DE|EN|FR|IT|ES|PT)\s?([0-9]{3})\s?([0-9]{3})\b/);
+    if (m) out.push({ number: m[3], total: String(+m[4]), code: m[1] && /[A-Z]/.test(m[1]) ? m[1] : "", lang: LANG_TOKENS[m[2]], w: weight * 0.8 });
+  }
+  return out;
+}
+function parseCardText(text) {
+  const r = { name: "", number: "", total: "", code: "", lang: "" };
+  const nc = numberCands(text);
+  if (nc.length) Object.assign(r, nc[0]);
   if (!r.number) { // Promo-Karten wie „SVP 027“
     const m = text.match(/\b(SVP|SWSH|SM|XY|BW|MEP)\s?([0-9]{2,3})\b/);
-    if (m) { r.code = m[1]; r.number = m[2]; }
+    if (m) { r.code = m[1]; r.number = ["SWSH", "SM", "XY", "BW"].includes(m[1]) ? m[1] + m[2] : m[2]; }
   }
-  r.numLang = r.lang; // Sprachkennung direkt neben der Nummer (sicherstes Merkmal)
+  r.numLang = r.lang;
   r.lang = detectLang(text, r.numLang);
-  // Name: Text vor der KP/HP-Angabe, sonst erste sinnvolle Zeile
-  const skip = /^(BASIS|BASIC|PHASE|STAGE|STUFE|BASE|ENTWICKLUNG|TRAINER|ENERGIE|ENERGY|ITEM|ARTIKEL|UNTERSTÜTZUNG|SUPPORTER)\b/i;
-  const hpLine = lines.find(l => /\b(KP|HP|PV|PS)\s*\d{2,3}/.test(l));
-  let name = hpLine ? hpLine.replace(/\b(KP|HP|PV|PS)\s*\d{2,3}.*$/, "") : (lines.find(l => /[A-Za-zÄÖÜäöü]{3,}/.test(l) && !skip.test(l)) || "");
-  name = name.replace(skip, "").replace(/[^A-Za-zÄÖÜäöüß0-9\-\s'.]/g, " ").replace(/\s+/g, " ").trim();
-  r.name = name.split(" ").slice(0, 4).join(" ");
   return r;
 }
 // Sprache der Karte aus mehreren Merkmalen: Kennung neben der Nummer, KP/HP/PV/PS und typische Wörter des Kartentexts
 const LANG_WORDS = {
   de: /\b(schwäche|schwache|resistenz|rückzug|ruckzug|entwickelt|phase|basis|lege|deines|deinen|deiner|gegners|gegnerische|schaden|karte|karten|ablagestapel|münze|munze|wirf|zieh|jede|diesem|dieses|wenn|auf|und|der|die|das|ein|eine|nicht)\b/gi,
   en: /\b(weakness|resistance|retreat|evolves|stage|basic|your|opponent|opponent's|damage|attach|discard|flip|coin|draw|each|this|if|and|the|from|does|pile|hand)\b/gi,
-  fr: /\b(faiblesse|résistance|retraite|niveau|votre|adverse|dégâts|defausse|défausse|pièce|piochez|attaque)\b/gi,
-  it: /\b(debolezza|resistenza|ritirata|fase|tuo|avversario|danni|scarta|moneta|pesca)\b/gi,
+  fr: /\b(faiblesse|résistance|retraite|niveau|votre|adverse|dégâts|defausse|défausse|pièce|piochez|attaque|cette|vos|une|des|les)\b/gi,
+  it: /\b(debolezza|resistenza|ritirata|fase|tuo|avversario|danni|scarta|moneta|pesca|questo|il|della|di|un)\b/gi,
   es: /\b(debilidad|resistencia|retirada|fase|tu|rival|daño|descarta|moneda|roba)\b/gi
 };
 function detectLang(text, numLang) {
@@ -1153,8 +1309,8 @@ function detectLang(text, numLang) {
   if (numLang && sc[numLang] !== undefined) sc[numLang] += 6;
   if (/\bKP\s*\d/.test(text)) sc.de += 4;
   if (/\bHP\s*\d/.test(text)) sc.en += 3;
-  if (/\bPV\s*\d/.test(text)) { sc.fr += 2; sc.it += 2; }
-  if (/\bPS\s*\d/.test(text)) sc.es += 3;
+  if (/\bPV\s*\d/.test(text)) sc.fr += 3;
+  if (/\bPS\s*\d/.test(text)) { sc.it += 2; sc.es += 2; }
   for (const [l, re] of Object.entries(LANG_WORDS)) sc[l] += Math.min(8, (text.match(re) || []).length);
   sc.de += Math.min(3, (text.match(/[äöüßÄÖÜ]/g) || []).length * 0.5);
   const best = Object.entries(sc).sort((a, b) => b[1] - a[1]);
@@ -1174,77 +1330,243 @@ function ocrLines(data) {
     const words = (l.words || []).filter(w => w.text.trim());
     if (!words.length) return;
     const hs = words.map(w => w.bbox.y1 - w.bbox.y0).sort((a, b) => a - b);
-    out.push({ text: l.text.trim(), words, y: l.bbox.y0, h: hs[Math.floor(hs.length / 2)], conf: l.confidence });
+    out.push({ text: l.text.trim(), words, x0: l.bbox.x0, x1: l.bbox.x1, y: l.bbox.y0, y1: l.bbox.y1, h: hs[Math.floor(hs.length / 2)], conf: l.confidence });
   })));
   return out;
 }
-const NAME_SKIP = /^(BASIS|BASIC|PHASE|STAGE|STUFE|BASE|ENTWICKLUNG|ENTWICKELT|EVOLVES|TRAINER|ENERGIE|ENERGY|ITEM|ARTIKEL|UNTERSTÜTZUNG|SUPPORTER|STADION|STADIUM|POKÉMON|POKEMON|TOOL|WERKZEUG)$/i;
+// Bereich der Karte im Bild aus den gut lesbaren Textzeilen schätzen
+function textHull(lines) {
+  const good = lines.filter(l => l.conf > 55 && (l.text.match(/[A-Za-zÄÖÜäöü]/g) || []).length >= 3);
+  if (good.length < 3) return null;
+  const q = (arr, p) => { const a = [...arr].sort((x, y) => x - y); return a[Math.min(a.length - 1, Math.max(0, Math.round(p * (a.length - 1))))]; };
+  const x0 = q(good.map(l => l.x0), 0.05), x1 = q(good.map(l => l.x1), 0.95);
+  const y0 = Math.min(...good.map(l => l.y)), y1 = Math.max(...good.map(l => l.y1));
+  if (x1 - x0 < 40 || y1 - y0 < 40) return null;
+  return { x0, x1, y0, y1 };
+}
+const NAME_SKIP = /^(BASIS|BASIC|PHASE|STAGE|STUFE|BASE|ENTWICKLUNG|ENTWICKELT|EVOLVES|TRAINER|ENERGIE|ENERGY|ITEM|ARTIKEL|UNTERSTÜTZUNG|UNTERSTÜTZER|SUPPORTER|STADION|STADIUM|POKÉMON|POKEMON|TOOL|WERKZEUG|NIVEAU|FASE|DRESSEUR|ALLENATORE|RARE|HOLO|ILLUS|PROMO|REVERSE|SELTEN)$/i;
 // Name = größte gut lesbare Schrift im oberen Bereich; Zusätze wie KP/HP-Werte und Zahlen werden entfernt
-function nameFromLines(lines, imgH, topOnly) {
-  const cands = lines.filter(l => (!topOnly || l.y < imgH * 0.4) && l.conf > 35).map(l => {
-    let ws = l.words.filter(w => w.confidence > 30).map(w => w.text);
+function nameFromLines(lines, maxY) {
+  const cands = lines.filter(l => (maxY == null || l.y < maxY) && l.conf > 30).map(l => {
+    let ws = l.words.filter(w => w.confidence > 25).map(w => w.text);
     const hp = ws.findIndex(t => /^(KP|HP|PV|PS)$/i.test(t) || /^(KP|HP|PV|PS)\d+/i.test(t));
     if (hp >= 0) ws = ws.slice(0, hp);
+    const digits = ws.join("").replace(/[^0-9]/g, "").length;
     ws = ws.map(t => t.replace(/[^A-Za-zÄÖÜäöüßéÉ\-'.]/g, "")).filter(t => t.length > 0 && !NAME_SKIP.test(t));
-    // nur Wörter mit Buchstaben, maximal 4
     const name = ws.filter(t => /[A-Za-zÄÖÜäöü]{2,}/.test(t) || /^(ex|EX|V|GX|VMAX|VSTAR)$/.test(t)).slice(0, 4).join(" ");
-    return { name, h: l.h, y: l.y, hp: hp >= 0 };
+    return { name, h: l.h, y: l.y, hp: hp >= 0, digits };
   }).filter(c => c.name.replace(/[^A-Za-zÄÖÜäöü]/g, "").length >= 3);
-  // Zeile mit KP/HP-Angabe zuerst, sonst größte Schrift (bei Gleichstand die obere)
   cands.sort((a, b) => (b.hp - a.hp) || (b.h - a.h) || (a.y - b.y));
   return cands.map(c => c.name);
 }
+
+/* --- Abgleich mit der Datenbank --- */
 // Ähnlichkeit zweier Namen 0..1 (Bigramme), robust gegen kleine Lesefehler
+const bigrams = (s) => { const m = new Map(); for (let i = 0; i < s.length - 1; i++) { const k = s.slice(i, i + 2); m.set(k, (m.get(k) || 0) + 1); } return m; };
+function diceMaps(A, la, B, lb) { let hit = 0; A.forEach((v, k) => { hit += Math.min(v, B.get(k) || 0); }); return 2 * hit / Math.max(1, la - 1 + lb - 1); }
 function nameSim(a, b) {
   a = norm(a); b = norm(b); if (!a || !b) return 0;
-  if (a === b || b.includes(a) || a.includes(b)) return 1;
-  const bg = (s) => { const m = new Map(); for (let i = 0; i < s.length - 1; i++) { const k = s.slice(i, i + 2); m.set(k, (m.get(k) || 0) + 1); } return m; };
-  const A = bg(a), B = bg(b); let hit = 0;
-  A.forEach((v, k) => { hit += Math.min(v, B.get(k) || 0); });
-  return 2 * hit / Math.max(1, a.length - 1 + b.length - 1);
+  if (a === b) return 1;
+  if (containsName(a, b)) return 0.92;
+  return diceMaps(bigrams(a), a.length, bigrams(b), b.length);
 }
+// „enthält“ zählt nur, wenn der kürzere Name lang genug ist (sonst passen Wortfetzen wie „rare“ auf viele Namen)
+const containsName = (a, b) => { const [s, l] = a.length <= b.length ? [a, b] : [b, a]; return s.length >= 6 && s.length >= 0.6 * l.length && l.includes(s); };
 const bestSim = (f, nm) => Math.max(0, ...[f.name, ...(f.names || [])].filter(Boolean).map(n => nameSim(n, nm)));
 const sameNum = (a, b) => String(a).replace(/^([A-Z]*)0+/i, "$1").toLowerCase() === String(b).replace(/^([A-Z]*)0+/i, "$1").toLowerCase();
+const setIdOf = (c) => c.id.slice(0, Math.max(0, c.id.length - String(c.localId).length - 1));
+// Liste aller Karten einer Sprache, eine Woche auf dem Gerät behalten; ohne Netz notfalls die ältere Kopie
+async function fetchIndexList(l) {
+  const url = `${API}/${l}/cards`;
+  let store = null, stale = null;
+  try {
+    store = await caches.open("kartenindex"); const hit = await store.match(url);
+    if (hit) { if (Date.now() - (+hit.headers.get("x-saved") || 0) < 7 * 864e5) return await hit.json(); stale = hit; }
+  } catch {}
+  try {
+    const r = await fetch(url); if (!r.ok) throw new Error("index");
+    const list = await r.json();
+    try { store && await store.put(url, new Response(JSON.stringify(list), { headers: { "x-saved": String(Date.now()), "content-type": "application/json" } })); } catch {}
+    return list;
+  } catch (e) { if (stale) return await stale.json(); throw e; }
+}
+// Kartenliste Deutsch + Englisch mit Namensverzeichnis für die unscharfe Namenssuche
+let indexPromise = null;
+async function cardIndex() {
+  if (!indexPromise) indexPromise = (async () => {
+    const [de, en] = await Promise.all([fetchIndexList("de").catch(() => []), fetchIndexList("en").catch(() => [])]);
+    if (!de.length && !en.length) throw new Error("index");
+    const byId = new Map();
+    const pocket = /^(A\d+[a-z]?|B\d+[a-z]?|P-A)-/; // Karten aus „Pokémon TCG Pocket“ gibt es nicht gedruckt
+    for (const [l, list] of [["en", en], ["de", de]]) for (const c of list) {
+      if (pocket.test(c.id)) continue;
+      const p = byId.get(c.id) || { id: c.id, localId: c.localId, names: {}, image: c.image, lang: l };
+      p.names[l] = c.name; if (l === state.lang || !p.image) { p.image = c.image || p.image; p.lang = l; }
+      byId.set(c.id, p);
+    }
+    const index = { byId, names: new Map(), extra: {} };
+    byId.forEach(c => Object.values(c.names).forEach(n => addName(index, n, c)));
+    return index;
+  })().catch(e => { indexPromise = null; throw e; });
+  return indexPromise;
+}
+function addName(index, n, c) {
+  const k = norm(n); if (!k) return;
+  if (!index.names.has(k)) index.names.set(k, { bg: bigrams(k), len: k.length, cards: [] });
+  const e = index.names.get(k); if (!e.cards.includes(c)) e.cards.push(c);
+}
+// Karten auf Französisch, Italienisch usw.: deren Namen bei Bedarf ins Verzeichnis aufnehmen
+async function addLangNames(index, l) {
+  if (index.extra[l]) return index.extra[l];
+  index.extra[l] = (async () => {
+    const list = await fetchIndexList(l);
+    for (const b of list) { const c = index.byId.get(b.id); if (c) { c.names[l] = b.name; addName(index, b.name, c); } }
+  })().catch(() => { delete index.extra[l]; });
+  return index.extra[l];
+}
+// Text einer Karte (Attacken, Fähigkeiten, Effekt, KP) mit dem erkannten Text vergleichen: Anteil wiedergefundener Wörter
+function textMatch(card, ocrNorm) {
+  if (!card) return 0;
+  const parts = [...(card.attacks || []).map(a => a.name), ...(card.abilities || []).map(a => a.name)].filter(Boolean);
+  let words = parts.flatMap(p => String(p).split(/\s+/)).map(norm).filter(w => w.length >= 4);
+  if (!words.length && card.effect) words = String(card.effect).split(/\s+/).map(norm).filter(w => w.length >= 5).slice(0, 12);
+  let score = 0, n = 0;
+  for (const w of words) { n++; if (ocrNorm.includes(w)) score++; else if (w.length >= 6 && ocrNorm.includes(w.slice(0, Math.ceil(w.length * 0.6)))) score += 0.6; }
+  let r = n ? score / n : 0;
+  if (card.hp && new RegExp(`(kp|hp|pv|ps)\\s?${card.hp}(?!\\d)`, "i").test(scan.rawText || "")) r += 0.25;
+  return Math.min(1, r);
+}
+// Zeichnername steht in jeder Sprache gleich auf der Karte: nur ganze Wörter aus dem unteren Kartenbereich vergleichen
+const ILLUS_STOP = new Set(["illus", "team", "graphics", "5ban", "planeta", "studio", "creatures", "pokemon", "nintendo", "gamefreak"]);
+function illusMatch(card, botWords) {
+  const toks = String(card?.illustrator || "").split(/[\s.,&\/]+/).map(norm).filter(t => t.length >= 5 && !/\d/.test(t) && !ILLUS_STOP.has(t));
+  return toks.length > 0 && toks.some(t => botWords.some(w => w.length >= 4 && nameSim(w, t) >= 0.8));
+}
+async function setsInfo() {
+  const [a, b] = await Promise.all([getSets(state.lang), getSets(OTHER(state.lang))]);
+  const m = new Map();
+  [...(b || []), ...(a || [])].forEach(s => { const p = m.get(s.id) || {}; m.set(s.id, { id: s.id, name: s.name, official: s.cardCount?.official ?? p.official, total: Math.max(s.cardCount?.total || 0, p.total || 0) }); });
+  return m;
+}
+// Offizielle Kürzel eines Sets aus den Set-Details (nur für die wenigen Sets der besten Kandidaten)
+async function setCodes(sid) {
+  for (const l of [state.lang, OTHER(state.lang)]) {
+    const d = await cardsOfSet(sid, l);
+    if (d) return [d.abbreviation?.official, d.abbreviations?.official, d.tcgOnline].filter(Boolean).map(c => String(c).toUpperCase());
+  }
+  return [];
+}
+// Typische Verwechslungen bei Kürzeln (O/D/0, I/1/L, S/5, B/8) angleichen
+const codeKey = (c) => String(c).toUpperCase().replace(/[O0Q]/g, "D").replace(/[1IL|]/g, "I").replace(/5/g, "S").replace(/8/g, "B");
+function editDist1(a, b) {
+  if (a === b) return true; if (Math.abs(a.length - b.length) > 1) return false;
+  let i = 0, j = 0, diff = 0;
+  while (i < a.length && j < b.length) { if (a[i] === b[j]) { i++; j++; continue; } if (++diff > 1) return false; if (a.length > b.length) i++; else if (b.length > a.length) j++; else { i++; j++; } }
+  return diff + (a.length - i) + (b.length - j) <= 1;
+}
+const digitsOf = (id) => String(id).replace(/^[A-Z]+/i, "").replace(/^0+/, "");
 // Ordnet die gelesenen Angaben einer Karte in der Datenbank zu
 async function identifyCard(f) {
-  const out = new Map();
-  const add = (c, score) => { const p = out.get(c.id); if (!p || p.score < score) out.set(c.id, { ...c, score }); };
-  const sets = await allSets();
-  let cand = [];
-  if (f.code) {
-    for (const l of [state.lang, OTHER(state.lang)]) {
-      const s = await findSet(f.code, l, false) || await findSet(f.code, l, true);
-      if (s) { cand.push(...await setGroup(s)); break; }
-    }
+  let index;
+  try { index = await cardIndex(); } catch { return identifyCardOld(f); }
+  if (["fr", "it", "es", "pt"].includes(f.lang)) await addLangNames(index, f.lang);
+  else if ((f.names || []).length && !f.lang) await Promise.all([addLangNames(index, "fr"), addLangNames(index, "it")]); // Sprache unklar: auch französische und italienische Namen prüfen
+  const sets = await setsInfo();
+  // Nummern: doppelte zusammenfassen, „82/122“ verwerfen, wenn auch „SV082/122“ gelesen wurde
+  let numCands = [];
+  for (const x of (f.numbers?.length ? f.numbers : (f.number ? [{ number: f.number, total: f.total, w: 1 }] : []))) {
+    const p = numCands.find(y => y.number === x.number && y.total === x.total);
+    if (p) p.w = Math.max(p.w, x.w ?? 1); else numCands.push({ ...x, w: x.w ?? 1 });
   }
+  numCands = numCands.filter(x => !(/^\d/.test(x.number) && numCands.some(y => /^[A-Z]/i.test(y.number) && digitsOf(y.number) === digitsOf(x.number) && y.total === x.total)));
+  const names = [...new Set([f.name, ...(f.names || [])].filter(Boolean).map(norm).filter(n => n.length >= 3))].slice(0, 8);
+  const cand = new Map();
+  const consider = (c) => { if (c && !cand.has(c.id)) cand.set(c.id, c); };
+  const totalOk = (sid, t) => { const si = sets.get(sid); return !!(t && si && String(si.official) === String(t)); };
+  // 1) Nummer passt genau, oder (bei passender Gesamtzahl) fehlen nur vordere Ziffern („8“ statt „058“)
+  if (numCands.length) index.byId.forEach(c => {
+    if (numCands.some(x => sameNum(c.localId, x.number) || (x.total && digitsOf(c.localId).endsWith(digitsOf(x.number)) && digitsOf(x.number) && totalOk(setIdOf(c), x.total)))) consider(c);
+  });
+  // 2) Name ähnlich (über alle Namen der Datenbank, robust gegen Lesefehler)
+  const simOf = new Map();
+  if (names.length) {
+    const nb = names.map(n => ({ bg: bigrams(n), len: n.length, n }));
+    index.names.forEach((e, k) => {
+      let s = 0;
+      for (const q of nb) { const v = k === q.n ? 1 : containsName(k, q.n) ? 0.92 : diceMaps(q.bg, q.len, e.bg, e.len); if (v > s) s = v; }
+      if (s >= 0.45) e.cards.forEach(c => { if ((simOf.get(c.id) || 0) < s) simOf.set(c.id, s); });
+    });
+    [...simOf].sort((a, b) => b[1] - a[1]).slice(0, 250).forEach(([id]) => consider(index.byId.get(id)));
+  }
+  // Punkte: Nummer (gewichtet nach Lesestelle), Gesamtzahl des Sets, Name
+  const scored = [...cand.values()].map(c => {
+    const sid = setIdOf(c), si = sets.get(sid);
+    let num = 0, tot = 0, exact = false;
+    const tooBig = /^\d+$/.test(c.localId) && si?.total && +c.localId > Math.max(si.total, si.official || 0) + 60;
+    for (const x of numCands) {
+      const t = totalOk(sid, x.total);
+      let n = 0;
+      if (sameNum(c.localId, x.number) && !tooBig) n = 1;
+      else if (t && digitsOf(x.number) && digitsOf(c.localId).endsWith(digitsOf(x.number))) n = 0.4;
+      if (!n) continue;
+      if ((n + (t ? 0.6 : 0)) * x.w > num + tot) { num = n * x.w; tot = t ? 0.6 * x.w : 0; exact = n === 1; }
+    }
+    const nsim = simOf.get(c.id) || 0;
+    // Nummer ohne vordere Ziffern bei unbrauchbarer Gesamtzahl: nur kleiner Ausschlag bei starkem Namen
+    const tie = !num && nsim >= 0.8 && numCands.some(x => digitsOf(x.number) && digitsOf(c.localId).endsWith(digitsOf(x.number))) ? 0.25 : 0;
+    return { ...c, name: c.names[state.lang] || Object.values(c.names)[0], score: num + tot + 1.1 * nsim + tie, nsim, num, tot, exact, text: 0 };
+  }).sort((a, b) => b.score - a.score).slice(0, numCands.length ? 14 : 40);
+  // Feinabgleich der besten Kandidaten: Kartentext (Attackennamen, KP), Zeichner, Setkürzel
+  const ocrNorm = norm(scan.rawText || "");
+  const botWords = String(scan.botText || "").split(/[^A-Za-zÄÖÜäöüßéÉ]+/).map(norm).filter(w => w.length >= 4);
+  if (ocrNorm.length > 20) await Promise.all(scored.map(async c => {
+    const langs = [...new Set([f.lang, "en", "de"])].filter(l => l && (c.names[l] || ["fr", "it", "es", "pt"].includes(l)));
+    let best = 0, il = false;
+    for (const l of langs.slice(0, 2)) { const full = await getCard(c.id, l); if (!full) continue; best = Math.max(best, textMatch(full, ocrNorm)); il = il || illusMatch(full, botWords); if (best > 0.5) break; }
+    c.text = best; c.illus = il; c.score += 0.9 * best + (il ? 0.4 : 0);
+  }));
+  const codes = [...new Set([...(f.codes || []), f.code].filter(Boolean).map(c => String(c).toUpperCase()))];
+  if (codes.length && scored.length) {
+    const topScore = Math.max(...scored.map(c => c.score));
+    const sids = [...new Set(scored.filter(c => c.score >= topScore - 0.6).map(setIdOf))].slice(0, 8);
+    const codeMap = new Map(await Promise.all(sids.map(async sid => [sid, await setCodes(sid)])));
+    const totals = numCands.map(x => x.total).filter(Boolean);
+    const exactSets = sids.filter(sid => codeMap.get(sid).some(k => codes.includes(k)));
+    // ähnliche Kürzel („ORI“ für „DRI“) nur unter Sets mit passender Gesamtzahl, sonst nur ein kleiner Ausschlag
+    const nearPool = totals.length ? sids.filter(sid => totals.some(t => totalOk(sid, t))) : sids;
+    const near = nearPool.filter(sid => codeMap.get(sid).some(k => codes.some(r => editDist1(codeKey(r), codeKey(k)))));
+    scored.forEach(c => {
+      const sid = setIdOf(c);
+      if (exactSets.includes(sid)) { c.score += 0.6; c.codeOk = true; }
+      else if (near.length === 1 && near[0] === sid) { if (totals.length) { c.score += 0.4; c.codeOk = true; } else c.score += 0.2; }
+    });
+  }
+  scored.sort((a, b) => b.score - a.score);
+  const out = scored.filter(c => c.score >= 0.75).slice(0, 24);
+  // eine gelesene Nummer mit gültiger Gesamtzahl, zu der die beste Karte nicht passt: nicht automatisch öffnen
+  out.validNum = numCands.some(x => x.total && [...sets.values()].some(st => String(st.official) === String(x.total)));
+  return out;
+}
+// Älterer Weg über die Namenssuche, falls die Kartenliste nicht geladen werden kann
+async function identifyCardOld(f) {
+  const out = new Map();
+  const add = (c, score) => { const p = out.get(c.id); if (!p || p.score < score) out.set(c.id, { ...c, score, nsim: bestSim(f, c.name), exact: !!f.number && sameNum(c.localId, f.number) }); };
+  let cand = [];
+  if (f.code) for (const l of [state.lang, OTHER(state.lang)]) { const s = await findSet(f.code, l, false) || await findSet(f.code, l, true); if (s) { cand.push(...await setGroup(s)); break; } }
   if (f.total) {
-    const L = state.lang, O = OTHER(L);
-    const [a, b] = await Promise.all([getSets(L), getSets(O)]);
+    const [a, b] = await Promise.all([getSets(state.lang), getSets(OTHER(state.lang))]);
     const byTotal = [...a, ...b].filter(s => String(s.cardCount?.official) === String(parseInt(f.total, 10)));
-    const ids = new Set(cand.map(s => s.id));
-    // Kürzel und Gesamtzahl passen zusammen: nur diese Sets; sonst beide Listen
-    const both = byTotal.filter(s => ids.has(s.id));
+    const ids = new Set(cand.map(s => s.id)); const both = byTotal.filter(s => ids.has(s.id));
     cand = both.length ? both : [...cand, ...byTotal];
   }
   const seen = new Set(); cand = cand.filter(s => !seen.has(s.id) && seen.add(s.id)).slice(0, 15);
-  if (f.number && cand.length) {
-    const lists = await Promise.all(cand.map(s => setCards(s.id)));
-    lists.forEach(list => (list || []).forEach(c => { if (sameNum(c.localId, f.number)) add(c, 1 + bestSim(f, c.name)); }));
-  }
+  if (f.number && cand.length) (await Promise.all(cand.map(s => setCards(s.id)))).forEach(list => (list || []).forEach(c => { if (sameNum(c.localId, f.number)) add(c, 1 + bestSim(f, c.name)); }));
   if (!out.size && (f.name || f.names?.length)) {
-    // alle Namensvarianten und einzelne längere Wörter probieren (Lesefehler in einem Wort sollen nicht alles verhindern)
-    const tries = [...new Set([f.name, ...(f.names || []), ...[f.name, ...(f.names || [])].flatMap(n => String(n || "").split(/[\s\-]+/).filter(w => w.length >= 4))])].filter(Boolean).slice(0, 6);
-    for (const t of tries) {
-      const hits = await nameSearch(t).catch(() => []);
-      hits.slice(0, 80).forEach(c => add(c, bestSim(f, c.name) + (f.number && sameNum(c.localId, f.number) ? 1 : 0)));
-      if (out.size >= 1 && [...out.values()].some(c => c.score >= 0.9)) break;
-    }
-    // unsichere Treffer aussortieren
+    const tries = [...new Set([f.name, ...(f.names || [])])].filter(Boolean).slice(0, 5);
+    for (const t of tries) { const hits = await nameSearch(t).catch(() => []); hits.slice(0, 80).forEach(c => add(c, bestSim(f, c.name) + (f.number && sameNum(c.localId, f.number) ? 1 : 0))); if ([...out.values()].some(c => c.score >= 0.9)) break; }
     [...out.values()].forEach(c => { if (c.score < 0.5) out.delete(c.id); });
   }
-  // Namen in der anderen Sprache prüfen, wenn die Nummer mehrere Treffer liefert
-  const list = [...out.values()].sort((x, y) => y.score - x.score);
-  return list.slice(0, 24);
+  return [...out.values()].sort((x, y) => y.score - x.score).slice(0, 24);
 }
 function scanFieldsHtml(f) {
   return `<fieldset class="add"><legend>Erkannte Angaben (bei Bedarf korrigieren)</legend>
@@ -1260,19 +1582,22 @@ function scanFieldsHtml(f) {
 }
 function renderScan() {
   $("status").textContent = "";
+  if (!tessWorker && !tessPromise) getTess().catch(() => {}); // Texterkennung schon vor dem Foto laden
   $("view").innerHTML = `
     <div class="panel scanbox">
       <label class="btn scanbtn" for="s-file">${scan.img ? "Neues Foto aufnehmen" : "Karte fotografieren"}</label>
       <input id="s-file" type="file" accept="image/*" capture="environment" hidden>
-      ${scan.img ? `<img class="scanprev" alt="Dein Foto" src="${scan.img}">` : `<p class="note" style="margin:0">Fotografiere die Karte gerade von vorn, gut beleuchtet und ohne Spiegelung, sodass sie das Bild möglichst ausfüllt. Wichtig ist, dass unten die Kartennummer (z. B. 154/128) und das Setkürzel lesbar sind. Die Erkennung läuft auf deinem Gerät.</p>`}
+      ${scan.img ? `<img class="scanprev" alt="Dein Foto" src="${scan.img}">` : `<p class="note" style="margin:0">Fotografiere die Karte von vorn, gut beleuchtet, vor einem ruhigen Hintergrund und mit etwas Rand rundherum. Bei Glanzkarten die Karte leicht kippen, bis keine Spiegelung mehr auf Name und Nummer liegt. Wichtig ist, dass unten die Kartennummer (z. B. 154/128) lesbar ist. Die Erkennung läuft auf deinem Gerät.</p>`}
       ${scan.msg ? `<p class="note scanmsg">${esc(scan.msg)}</p>` : ""}
     </div>
     ${scan.fields ? scanFieldsHtml(scan.fields) : ""}
     ${scan.text ? `<details class="note" style="margin-top:10px"><summary>Erkannten Text anzeigen</summary><pre style="white-space:pre-wrap;font-size:12px">${esc(scan.text)}</pre></details>` : ""}
     ${scan.cands ? `<h2 class="section">${scan.cands.length === 1 ? "Erkannte Karte" : scan.cands.length ? `${scan.cands.length} mögliche Karten, tippe auf die richtige` : "Keine passende Karte gefunden"}</h2><div class="grid" id="s-grid"></div>` : ""}`;
-  $("s-file").addEventListener("change", e => { const f = e.target.files?.[0]; if (f) runScan(f); });
+  $("s-file").addEventListener("change", e => { const f = e.target.files?.[0]; e.target.value = ""; if (f) runScan(f); });
   if (scan.fields) $("s-search").onclick = () => {
-    scan.fields = { names: [], name: $("s-name").value.trim(), number: $("s-num").value.trim(), total: $("s-total").value.trim(), code: $("s-code").value.trim().toUpperCase(), lang: $("s-lang").value };
+    const number = $("s-num").value.trim().toUpperCase(), total = $("s-total").value.trim();
+    scan.fields = { ...scan.fields, names: [], name: $("s-name").value.trim(), number, total, numbers: number ? [{ number, total, w: 1 }] : [], codes: [], code: $("s-code").value.trim().toUpperCase(), lang: $("s-lang").value };
+    scan.cardFound = undefined;
     runIdentify();
   };
   if (scan.cands?.length) {
@@ -1281,58 +1606,122 @@ function renderScan() {
       getCard(c.id, c.lang || state.lang).then(full => { if (full && document.contains(t)) { const n = cardTile(c, full); n.onclick = t.onclick; t.replaceWith(n); } }); });
   }
 }
+// Liest Name, Kartentext und Nummer aus dem Foto. Findet erst die Karte im Bild, sonst Rückfall auf Bildbereiche
+async function readCard(w, base, say) {
+  const angle = estimateSkew(base);
+  const { W, H } = rotatedSize(base, angle);
+  const card = findCard(base, angle);
+  const texts = [], names = [], bots = []; let nums = [];
+  const run = async (c, psm) => { const d = await ocr(w, c, psm); c.width = c.height = 0; texts.push(d.text); return d; };
+  const strip = async (rect, scale, psm) => {
+    let c = renderRegion(base, angle, rect, scale);
+    const dark = meanLum(c) < 90;
+    if (dark) c = renderRegion(base, angle, rect, scale, { invert: true });
+    return { d: await run(c, psm), dark };
+  };
+  if (card) {
+    const { x, y, w: cw, h: chh } = card;
+    // ganze Karte (für Kartentext und Sprache)
+    const sc = Math.min(3, 1200 / cw);
+    const full = await run(renderRegion(base, angle, { x: x - cw * 0.03, y: y - chh * 0.03, w: cw * 1.06, h: chh * 1.06 }, sc), 3);
+    const lines = ocrLines(full);
+    say("Lese den Kartennamen…");
+    const topRect = { x: x - cw * 0.03, y: y - chh * 0.06, w: cw * 1.06, h: chh * 0.26 }, tsc = Math.min(3.5, 1300 / cw);
+    const top = await strip(topRect, tsc, 6);
+    names.push(...nameFromLines(ocrLines(top.d)), ...nameFromLines(lines, (chh * 0.2 + chh * 0.03) * sc));
+    if (!names.length) { // andere Helligkeit und geschärft nochmal versuchen
+      const t2 = await run(binarize(renderRegion(base, angle, topRect, tsc, { invert: top.dark }), 2 * tsc), 11);
+      names.push(...nameFromLines(ocrLines(t2)));
+      if (!names.length) names.push(...nameFromLines(ocrLines(await run(binarize(renderRegion(base, angle, topRect, tsc, { invert: !top.dark }), 2 * tsc), 11))));
+    }
+    say("Lese Kartennummer und Set…");
+    const botRect = { x: x - cw * 0.03, y: y + chh * 0.82, w: cw * 1.06, h: chh * 0.21 };
+    const bs = Math.min(4, 2200 / cw);
+    const bot = await strip(botRect, bs, 11);
+    bots.push(bot.d.text);
+    nums = numberCands(bot.d.text);
+    const more = async (c, psm, wt) => { const d = await run(c, psm); bots.push(d.text); return numberCands(d.text, wt); };
+    if (!nums.length) nums = await more(renderRegion(base, angle, botRect, bs, { invert: !bot.dark, contrast: 1.7 }), 6, 1);
+    if (!nums.length) nums = await more(binarize(renderRegion(base, angle, botRect, bs, { invert: bot.dark, contrast: 1.2 }), 2 * bs), 6, 0.9);
+    if (!nums.length) nums = await more(binarize(renderRegion(base, angle, botRect, bs, { invert: !bot.dark, contrast: 1.2 }), 2 * bs), 11, 0.9);
+    nums.push(...numberCands(full.text, 0.7));
+  }
+  if (!card || !nums.length || !names.length) {
+    // Rückfall: ganzes Bild, oberer und unterer Bereich
+    const s1 = Math.min(1, 1800 / Math.max(W, H));
+    const full = await run(renderRegion(base, angle, { x: 0, y: 0, w: W, h: H }, s1), 3);
+    if (!names.length) {
+      const top = await strip({ x: 0, y: 0, w: W, h: H * 0.4 }, Math.min(1.4, 2000 / W), 3);
+      names.push(...nameFromLines(ocrLines(top.d)), ...nameFromLines(ocrLines(full), H * 0.4 * s1));
+    }
+    if (!nums.length) {
+      const bot = await strip({ x: 0, y: H * 0.55, w: W, h: H * 0.45 }, Math.min(1.6, 2600 / W), 11); bots.push(bot.d.text);
+      nums = [...numberCands(bot.d.text, 0.9), ...numberCands(full.text, 0.7)];
+    }
+  }
+  return { texts, names, nums, card, angle, bots };
+}
 async function runScan(file) {
   if (scan.busy) return;
-  scan.busy = true; scan.cands = null; scan.fields = null;
+  scan.busy = true; scan.cands = null; scan.fields = null; scan.rawText = "";
   try { if (scan.img) URL.revokeObjectURL(scan.img); } catch {}
   scan.img = URL.createObjectURL(file);
   scan.msg = "Texterkennung wird geladen…"; renderScan();
   const say = (t) => { scan.msg = t; const el = document.querySelector(".scanmsg"); if (el) el.textContent = t; };
   try {
+    cardIndex().catch(() => {}); // Kartenliste parallel laden
     const w = await getTess((st, p) => { if (/load|init/i.test(st)) say(`Texterkennung wird geladen… ${Math.round(p * 100)} %`); else if (/recogn/i.test(st)) say(`Lese die Karte… ${Math.round(p * 100)} %`); });
     say("Lese die Karte…");
-    const fullCanvas = await imageCanvas(file);
-    const full = await w.recognize(fullCanvas);
-    let f = parseCardText(full.data.text);
-    // Name gezielt im oberen Drittel lesen (vergrößert), dort steht er auf jeder Karte
-    say("Lese den Kartennamen…");
-    const topCanvas = await imageCanvas(file, -0.33);
-    const top = await w.recognize(topCanvas);
-    const names = [...nameFromLines(ocrLines(top.data), topCanvas.height, false), ...nameFromLines(ocrLines(full.data), fullCanvas.height, true)];
-    f.names = [...new Set(names)].slice(0, 4);
-    if (f.names.length) f.name = f.names[0];
-    f.lang = detectLang(top.data.text + "\n" + full.data.text, f.numLang);
-    if (!f.number) { // zweiter Versuch: unteres Drittel vergrößert, dort stehen Nummer und Setkürzel
-      const bottom = await w.recognize(await imageCanvas(file, 0.35));
-      const b = parseCardText(bottom.data.text);
-      f = { ...f, number: b.number || f.number, total: b.total || f.total, code: f.code || b.code, lang: f.lang || b.lang };
-    }
-    scan.text = top.data.text + "\n---\n" + full.data.text;
+    let base;
+    try { base = await loadPhoto(file); } catch { scan.msg = "Das Foto konnte nicht geöffnet werden. Versuch es mit einem neuen Foto."; scan.fields = { name: "", number: "", total: "", code: "", lang: "" }; renderScan(); return; }
+    let res = await readCard(w, base, say);
+    if (!res.card && !res.names.length && !res.nums.length) res = await readCard(w, rotate90(base), say); // Karte quer fotografiert
+    if (!res.names.length && !res.nums.length) res = await readCard(w, rotate90(rotate90(base)), say); // Karte steht auf dem Kopf
+    base.width = base.height = 0;
+    const { texts, names, nums } = res;
+    scan.botText = res.bots.join("\n");
+    scan.cardFound = !!res.card;
+    const allText = texts.join("\n");
+    scan.rawText = allText;
+    const f = parseCardText(allText);
+    if (nums.length) Object.assign(f, { number: nums[0].number, total: nums[0].total, code: nums.find(x => x.code)?.code || "", numLang: nums.find(x => x.lang)?.lang || "" });
+    f.codes = [...new Set(nums.map(x => x.code).filter(Boolean))];
+    f.numbers = nums.length ? nums.map(x => ({ number: x.number, total: x.total, w: x.w ?? 1 })) : (f.number ? [{ number: f.number, total: f.total, w: 1 }] : []);
+    f.names = [...new Set(names)].slice(0, 6);
+    f.name = f.names[0] || "";
+    f.lang = detectLang(allText, f.numLang);
+    scan.text = allText;
     scan.fields = f;
     await runIdentify(true);
   } catch (e) {
-    scan.msg = "Die Texterkennung konnte nicht geladen werden. Prüfe deine Internetverbindung und versuche es noch einmal.";
+    console.error(e);
+    scan.msg = !tessWorker ? "Die Texterkennung konnte nicht geladen werden. Prüfe deine Internetverbindung und versuche es noch einmal." : "Beim Auswerten des Fotos ist ein Fehler aufgetreten. Versuch es bitte noch einmal.";
     scan.fields = scan.fields || { name: "", number: "", total: "", code: "", lang: "" };
     renderScan();
   } finally { scan.busy = false; }
 }
 async function runIdentify(fromPhoto) {
   const f = scan.fields;
-  if (!f.name && !f.number) { scan.cands = []; scan.msg = "Auf dem Foto war weder Name noch Kartennummer lesbar. Versuch ein schärferes Foto oder trag die Angaben unten selbst ein."; renderScan(); return; }
+  if (!f.name && !f.number && !(f.names || []).length) { scan.cands = []; scan.msg = "Auf dem Foto war weder Name noch Kartennummer lesbar. Versuch ein schärferes Foto oder trag die Angaben unten selbst ein."; renderScan(); return; }
   scan.msg = "Suche die Karte in der Datenbank…"; renderScan();
   try {
     const list = await identifyCard(f);
     const want = ["de", "en"].includes(f.lang) ? f.lang : null;
     if (want) await Promise.all(list.slice(0, 12).map(async c => { if (c.lang !== want) { const v = await getCard(c.id, want); if (v) { c.lang = want; c.name = v.name; c.image = v.image || c.image; } } }));
     scan.cands = list;
-    const sure = list.length === 1 || (list.length > 1 && list[0].score >= 1.6 && list[1].score < list[0].score - 0.3);
+    // automatisch öffnen nur bei klarem Vorsprung und einer unabhängigen Bestätigung (Name, Kartentext, Setkürzel oder Zeichner)
+    const t = list[0], confirmed = t && (t.nsim >= 0.6 || (t.text || 0) >= 0.35 || t.codeOk || t.illus);
+    const sure = !!t && (confirmed ? t.score >= 1.6 : (t.exact && t.score >= 1.9)) && (list.length === 1 || list[1].score < t.score - 0.35)
+      && !(list.validNum && !t.num && !t.tot) // Nummer gelesen, passt aber nicht zur Karte
+      && (scan.cardFound !== false || t.codeOk); // ohne erkannten Kartenrand könnten Name und Nummer von verschiedenen Karten stammen
     scan.msg = !list.length ? "Keine passende Karte gefunden. Prüf die erkannten Angaben unten und such erneut."
       : sure ? `Erkannt: ${list[0].name}${f.number ? " · Nr. " + f.number : ""}${f.lang ? " · " + LANGS[f.lang] : ""}.`
       : "Die Angaben passen auf mehrere Karten. Tippe unten auf die richtige.";
     if (sure) { scan.cands = [list[0]]; f.name = list[0].name; }
     renderScan();
     if (sure && fromPhoto && state.view === "scan") openScanned(list[0], f);
-  } catch {
+  } catch (e) {
+    console.error(e);
     scan.msg = "Die Kartendatenbank ist gerade nicht erreichbar. Versuch es gleich noch einmal."; renderScan();
   }
 }
