@@ -808,10 +808,24 @@ async function recordCollValue() {
   await refreshPrices();
   const total = coll.reduce((s, e) => s + entryValue(e), 0);
   if (!(total > 0)) return;
-  collHist.push({ d: new Date().toISOString(), p: Math.round(total * 100) / 100 });
+  // Wert je Eintrag mitspeichern, damit gelöschte Karten später aus dem Verlauf herausgerechnet werden können
+  const parts = {}; coll.forEach(e => { const v = entryValue(e); if (v > 0) parts[e.uid] = Math.round(v * 100) / 100; });
+  collHist.push({ d: new Date().toISOString(), p: Math.round(total * 100) / 100, e: parts });
   if (collHist.length > 1000) collHist = collHist.slice(-1000);
   store.set("collHist", collHist);
   if (state.view === "coll") renderColl();
+}
+// Entfernt den Anteil einer gelöschten Karte aus allen Messpunkten der Wertentwicklung
+function removeFromHist(entry) {
+  const created = parseInt(String(entry.uid).slice(0, -4), 36); // Zeitpunkt des Hinzufügens steckt in der ID
+  const fallback = entryValue(entry); // ältere Messpunkte ohne Aufschlüsselung: aktueller Wert als Näherung
+  collHist = collHist.map(pt => {
+    let p = pt.p;
+    if (pt.e) { if (pt.e[entry.uid] != null) { p -= pt.e[entry.uid]; const e = { ...pt.e }; delete e[entry.uid]; return { ...pt, p: Math.round(p * 100) / 100, e }; } return pt; }
+    if (!isNaN(created) && new Date(pt.d).getTime() >= created) p -= fallback;
+    return { ...pt, p: Math.round(p * 100) / 100 };
+  }).filter(pt => pt.p > 0.004);
+  store.set("collHist", collHist);
 }
 function collChartHtml(total, invested) {
   const h = collHist;
@@ -1047,7 +1061,7 @@ async function openEntrySheet(uid) {
   let armed = false;
   $("del").onclick = () => {
     if (!armed) { armed = true; $("del").textContent = "Wirklich entfernen? Nochmal tippen"; return; }
-    coll = coll.filter(x => x.uid !== uid); saveColl(); closeSheet(); renderColl(); toast("Entfernt");
+    removeFromHist(e); coll = coll.filter(x => x.uid !== uid); saveColl(); closeSheet(); renderColl(); toast("Entfernt, auch aus der Wertentwicklung");
   };
 }
 
