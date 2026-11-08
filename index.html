@@ -204,7 +204,10 @@ const CONDS = {
 const VARIANTS = { normal: "Normal", holo: "Holo / Reverse Holo" };
 
 const eur = (n) => (typeof n === "number" && n > 0) ? n.toLocaleString("de-DE", { style: "currency", currency: "EUR" }) : "–";
-const img = (base, q) => base ? `${base}/${q}.webp` : "";
+// Viele ältere und ganz neue Karten haben in der Datenbank (noch) kein Bild: dann ein neutraler Platzhalter
+const NO_IMG = "data:image/svg+xml;charset=utf-8," + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 245 342"><rect width="245" height="342" rx="14" fill="#d9dfe9"/><rect x="12" y="12" width="221" height="318" rx="10" fill="#eef1f6"/><text x="122" y="168" text-anchor="middle" font-family="-apple-system,Segoe UI,sans-serif" font-size="16" fill="#6b7486">Kein Bild</text><text x="122" y="190" text-anchor="middle" font-family="-apple-system,Segoe UI,sans-serif" font-size="12" fill="#8a93a5">in der Datenbank</text></svg>');
+const img = (base, q) => base ? `${base}/${q}.webp` : NO_IMG;
+document.addEventListener("error", e => { const t = e.target; if (t.tagName === "IMG" && t.src !== NO_IMG) t.src = NO_IMG; }, true);
 const num = (v) => (typeof v === "number" && v > 0) ? v : null;
 
 // Cardmarket-Sprachcodes: 1 Englisch, 2 Französisch, 3 Deutsch, 4 Spanisch, 5 Italienisch, 7 Japanisch, 8 Portugiesisch, 10 Koreanisch
@@ -376,7 +379,11 @@ async function fetchPages(url) {
 function mergeById(primary, secondary) {
   const m = new Map();
   primary.forEach(c => m.set(c.id, c));
-  secondary.forEach(c => { if (!m.has(c.id)) m.set(c.id, c); });
+  secondary.forEach(c => {
+    const p = m.get(c.id);
+    if (!p) m.set(c.id, c);
+    else if (!p.image && c.image) m.set(c.id, { ...p, image: c.image }); // Bild aus der anderen Sprache übernehmen
+  });
   return [...m.values()];
 }
 async function nameSearch(q) {
@@ -468,6 +475,7 @@ async function search(q) {
     if (set) {
       const cards = await setCards(set.id);
       if (!cards) throw new Error("set");
+      if (!cards.length) { status.textContent = `Für das Set ${set.name} enthält die Kartendatenbank noch keine Karten, weder auf Deutsch noch auf Englisch.`; $("view").innerHTML = ""; return; }
       if (cards.total && cards.length < cards.total) coverage = ` Hinweis: Die Kartendatenbank enthält von diesem Set bisher erst ${cards.length} von ${cards.total} Karten.`;
       // Details aller Setkarten laden: für die Seltenheit und um Namen sprachübergreifend über die Pokédex-Nummer zu erkennen
       let done = 0, i = 0;
@@ -495,10 +503,9 @@ async function search(q) {
       list = cards.map((c, k) => ({ ...c, rarity: full[k]?.rarity, rank: rarityRank(full[k]?.rarity), dex: full[k]?.dexId || [] }))
         .filter(c => numOk(c) && (!n || norm(c.name).includes(n) || ids.has(c.id) ||
           (c.dex.some(d => qDex.has(d)) && words.every(w => norm(c.name).includes(w)))))
-        .filter(c => c.image)
         .sort((x, y) => y.rank - x.rank || localNum(y.localId) - localNum(x.localId));
-      if (!list.length && !setId) { coverage = coverage || ""; const fb = (await nameSearch(q).catch(() => [])).filter(c => c.image); if (fb.length) { set = null; list = fb; } }
-    } else list = (await nameSearch(q)).filter(c => c.image);
+      if (!list.length && !setId) { coverage = coverage || ""; const fb = await nameSearch(q).catch(() => []); if (fb.length) { set = null; list = fb; } }
+    } else list = await nameSearch(q);
     if (state.token !== token) return;
     label = set ? `${name ? "„" + name + "“ im Set " : "Set "}${set.name}${number ? ", Nr. " + number : ""}` : `„${q}“`;
     if (!list.length) { status.textContent = `Keine Karten zu ${label} gefunden. Prüfe die Schreibweise.${coverage}`; return; }
@@ -518,8 +525,10 @@ async function allSets() {
   const L = state.lang, O = OTHER(L);
   const [a, b] = await Promise.all([getSets(L), getSets(O)]);
   const m = new Map();
-  (b || []).forEach((s, i) => m.set(s.id, { id: s.id, name: s.name, order: i }));
-  (a || []).forEach((s, i) => m.set(s.id, { id: s.id, name: s.name, order: m.get(s.id)?.order ?? i }));
+  const count = (s) => s.cardCount?.total ?? s.cardCount?.official ?? 1;
+  (b || []).forEach((s, i) => m.set(s.id, { id: s.id, name: s.name, order: i, n: count(s) }));
+  (a || []).forEach((s, i) => m.set(s.id, { id: s.id, name: s.name, order: m.get(s.id)?.order ?? i, n: Math.max(count(s), m.get(s.id)?.n ?? 0) }));
+  [...m.values()].forEach(s => { if (!s.n) m.delete(s.id); }); // Sets ohne Karten ausblenden
   setsMerged = [...m.values()].sort((x, y) => y.order - x.order);
   if (!setsMerged.length) setsMerged = null;
   return setsMerged || [];
