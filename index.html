@@ -1052,7 +1052,8 @@ async function getTess(onProgress) {
 async function imageCanvas(file, crop) {
   const bmp = await createImageBitmap(file);
   const maxW = crop ? 2400 : 1800;
-  const sx = 0, sy = crop ? Math.round(bmp.height * (1 - crop)) : 0, sw = bmp.width, sh = crop ? bmp.height - sy : bmp.height;
+  // crop > 0: unterer Anteil des Bildes, crop < 0: oberer Anteil
+  const sx = 0, sy = crop > 0 ? Math.round(bmp.height * (1 - crop)) : 0, sw = bmp.width, sh = crop ? Math.round(bmp.height * Math.abs(crop)) : bmp.height;
   const scale = Math.min(1, maxW / sw) * (crop ? 1.6 : 1);
   const c = document.createElement("canvas");
   c.width = Math.round(sw * scale); c.height = Math.round(sh * scale);
@@ -1100,6 +1101,33 @@ function parseCardText(text) {
   r.name = name.split(" ").slice(0, 4).join(" ");
   return r;
 }
+// Zeilen mit Position, Schrifthöhe und Erkennungssicherheit aus dem Tesseract-Ergebnis
+function ocrLines(data) {
+  const out = [];
+  (data.blocks || []).forEach(b => (b.paragraphs || []).forEach(p => (p.lines || []).forEach(l => {
+    const words = (l.words || []).filter(w => w.text.trim());
+    if (!words.length) return;
+    const hs = words.map(w => w.bbox.y1 - w.bbox.y0).sort((a, b) => a - b);
+    out.push({ text: l.text.trim(), words, y: l.bbox.y0, h: hs[Math.floor(hs.length / 2)], conf: l.confidence });
+  })));
+  return out;
+}
+const NAME_SKIP = /^(BASIS|BASIC|PHASE|STAGE|STUFE|BASE|ENTWICKLUNG|ENTWICKELT|EVOLVES|TRAINER|ENERGIE|ENERGY|ITEM|ARTIKEL|UNTERSTÜTZUNG|SUPPORTER|STADION|STADIUM|POKÉMON|POKEMON|TOOL|WERKZEUG)$/i;
+// Name = größte gut lesbare Schrift im oberen Bereich; Zusätze wie KP/HP-Werte und Zahlen werden entfernt
+function nameFromLines(lines, imgH, topOnly) {
+  const cands = lines.filter(l => (!topOnly || l.y < imgH * 0.4) && l.conf > 35).map(l => {
+    let ws = l.words.filter(w => w.confidence > 30).map(w => w.text);
+    const hp = ws.findIndex(t => /^(KP|HP|PV|PS)$/i.test(t) || /^(KP|HP|PV|PS)\d+/i.test(t));
+    if (hp >= 0) ws = ws.slice(0, hp);
+    ws = ws.map(t => t.replace(/[^A-Za-zÄÖÜäöüßéÉ\-'.]/g, "")).filter(t => t.length > 0 && !NAME_SKIP.test(t));
+    // nur Wörter mit Buchstaben, maximal 4
+    const name = ws.filter(t => /[A-Za-zÄÖÜäöü]{2,}/.test(t) || /^(ex|EX|V|GX|VMAX|VSTAR)$/.test(t)).slice(0, 4).join(" ");
+    return { name, h: l.h, y: l.y, hp: hp >= 0 };
+  }).filter(c => c.name.replace(/[^A-Za-zÄÖÜäöü]/g, "").length >= 3);
+  // Zeile mit KP/HP-Angabe zuerst, sonst größte Schrift (bei Gleichstand die obere)
+  cands.sort((a, b) => (b.hp - a.hp) || (b.h - a.h) || (a.y - b.y));
+  return cands.map(c => c.name);
+}
 // Ähnlichkeit zweier Namen 0..1 (Bigramme), robust gegen kleine Lesefehler
 function nameSim(a, b) {
   a = norm(a); b = norm(b); if (!a || !b) return 0;
@@ -1109,6 +1137,7 @@ function nameSim(a, b) {
   A.forEach((v, k) => { hit += Math.min(v, B.get(k) || 0); });
   return 2 * hit / Math.max(1, a.length - 1 + b.length - 1);
 }
+const bestSim = (f, nm) => Math.max(0, ...[f.name, ...(f.names || [])].filter(Boolean).map(n => nameSim(n, nm)));
 const sameNum = (a, b) => String(a).replace(/^([A-Z]*)0+/i, "$1").toLowerCase() === String(b).replace(/^([A-Z]*)0+/i, "$1").toLowerCase();
 // Ordnet die gelesenen Angaben einer Karte in der Datenbank zu
 async function identifyCard(f) {
@@ -1134,11 +1163,18 @@ async function identifyCard(f) {
   const seen = new Set(); cand = cand.filter(s => !seen.has(s.id) && seen.add(s.id)).slice(0, 15);
   if (f.number && cand.length) {
     const lists = await Promise.all(cand.map(s => setCards(s.id)));
-    lists.forEach(list => (list || []).forEach(c => { if (sameNum(c.localId, f.number)) add(c, 1 + (f.name ? nameSim(f.name, c.name) : 0)); }));
+    lists.forEach(list => (list || []).forEach(c => { if (sameNum(c.localId, f.number)) add(c, 1 + bestSim(f, c.name)); }));
   }
-  if (!out.size && f.name) {
-    const hits = await nameSearch(f.name).catch(() => []);
-    hits.slice(0, 60).forEach(c => add(c, nameSim(f.name, c.name) + (f.number && sameNum(c.localId, f.number) ? 1 : 0)));
+  if (!out.size && (f.name || f.names?.length)) {
+    // alle Namensvarianten und einzelne längere Wörter probieren (Lesefehler in einem Wort sollen nicht alles verhindern)
+    const tries = [...new Set([f.name, ...(f.names || []), ...[f.name, ...(f.names || [])].flatMap(n => String(n || "").split(/[\s\-]+/).filter(w => w.length >= 4))])].filter(Boolean).slice(0, 6);
+    for (const t of tries) {
+      const hits = await nameSearch(t).catch(() => []);
+      hits.slice(0, 80).forEach(c => add(c, bestSim(f, c.name) + (f.number && sameNum(c.localId, f.number) ? 1 : 0)));
+      if (out.size >= 1 && [...out.values()].some(c => c.score >= 0.9)) break;
+    }
+    // unsichere Treffer aussortieren
+    [...out.values()].forEach(c => { if (c.score < 0.5) out.delete(c.id); });
   }
   // Namen in der anderen Sprache prüfen, wenn die Nummer mehrere Treffer liefert
   const list = [...out.values()].sort((x, y) => y.score - x.score);
@@ -1147,7 +1183,7 @@ async function identifyCard(f) {
 function scanFieldsHtml(f) {
   return `<fieldset class="add"><legend>Erkannte Angaben (bei Bedarf korrigieren)</legend>
     <div class="fields">
-      <label style="grid-column:1/-1">Name<input id="s-name" type="text" value="${esc(f.name)}" placeholder="z. B. Gengar-ex"></label>
+      <label style="grid-column:1/-1">Name<input id="s-name" type="text" list="s-names" value="${esc(f.name)}" placeholder="z. B. Gengar-ex"><datalist id="s-names">${(f.names || []).map(n => `<option value="${esc(n)}">`).join("")}</datalist></label>
       <label>Kartennummer<input id="s-num" type="text" value="${esc(f.number)}" placeholder="z. B. 154"></label>
       <label>von (Gesamtzahl)<input id="s-total" type="text" inputmode="numeric" value="${esc(f.total)}" placeholder="z. B. 128"></label>
       <label>Setkürzel<input id="s-code" type="text" value="${esc(f.code)}" placeholder="z. B. 30C"></label>
@@ -1166,10 +1202,11 @@ function renderScan() {
       ${scan.msg ? `<p class="note scanmsg">${esc(scan.msg)}</p>` : ""}
     </div>
     ${scan.fields ? scanFieldsHtml(scan.fields) : ""}
+    ${scan.text ? `<details class="note" style="margin-top:10px"><summary>Erkannten Text anzeigen</summary><pre style="white-space:pre-wrap;font-size:12px">${esc(scan.text)}</pre></details>` : ""}
     ${scan.cands ? `<h2 class="section">${scan.cands.length === 1 ? "Erkannte Karte" : scan.cands.length ? `${scan.cands.length} mögliche Karten, tippe auf die richtige` : "Keine passende Karte gefunden"}</h2><div class="grid" id="s-grid"></div>` : ""}`;
   $("s-file").addEventListener("change", e => { const f = e.target.files?.[0]; if (f) runScan(f); });
   if (scan.fields) $("s-search").onclick = () => {
-    scan.fields = { name: $("s-name").value.trim(), number: $("s-num").value.trim(), total: $("s-total").value.trim(), code: $("s-code").value.trim().toUpperCase(), lang: $("s-lang").value };
+    scan.fields = { names: [], name: $("s-name").value.trim(), number: $("s-num").value.trim(), total: $("s-total").value.trim(), code: $("s-code").value.trim().toUpperCase(), lang: $("s-lang").value };
     runIdentify();
   };
   if (scan.cands?.length) {
@@ -1188,14 +1225,23 @@ async function runScan(file) {
   try {
     const w = await getTess((st, p) => { if (/load|init/i.test(st)) say(`Texterkennung wird geladen… ${Math.round(p * 100)} %`); else if (/recogn/i.test(st)) say(`Lese die Karte… ${Math.round(p * 100)} %`); });
     say("Lese die Karte…");
-    const full = await w.recognize(await imageCanvas(file));
+    const fullCanvas = await imageCanvas(file);
+    const full = await w.recognize(fullCanvas);
     let f = parseCardText(full.data.text);
+    // Name gezielt im oberen Drittel lesen (vergrößert), dort steht er auf jeder Karte
+    say("Lese den Kartennamen…");
+    const topCanvas = await imageCanvas(file, -0.33);
+    const top = await w.recognize(topCanvas);
+    const names = [...nameFromLines(ocrLines(top.data), topCanvas.height, false), ...nameFromLines(ocrLines(full.data), fullCanvas.height, true)];
+    f.names = [...new Set(names)].slice(0, 4);
+    if (f.names.length) f.name = f.names[0];
+    if (!f.lang) f.lang = parseCardText(top.data.text).lang;
     if (!f.number) { // zweiter Versuch: unteres Drittel vergrößert, dort stehen Nummer und Setkürzel
       const bottom = await w.recognize(await imageCanvas(file, 0.35));
       const b = parseCardText(bottom.data.text);
       f = { ...f, number: b.number || f.number, total: b.total || f.total, code: f.code || b.code, lang: f.lang || b.lang };
     }
-    scan.text = full.data.text;
+    scan.text = top.data.text + "\n---\n" + full.data.text;
     scan.fields = f;
     await runIdentify(true);
   } catch (e) {
@@ -1215,7 +1261,7 @@ async function runIdentify(fromPhoto) {
     scan.msg = !list.length ? "Keine passende Karte gefunden. Prüf die erkannten Angaben unten und such erneut."
       : sure ? `Erkannt: ${list[0].name}${f.number ? " · Nr. " + f.number : ""}${f.lang ? " · " + LANGS[f.lang] : ""}.`
       : "Die Angaben passen auf mehrere Karten. Tippe unten auf die richtige.";
-    if (sure) scan.cands = [list[0]];
+    if (sure) { scan.cands = [list[0]]; f.name = list[0].name; }
     renderScan();
     if (sure && fromPhoto && state.view === "scan") openCardSheet(list[0].id, list[0].lang || state.lang, f.lang);
   } catch {
