@@ -63,7 +63,7 @@ main { padding: 14px max(16px, env(safe-area-inset-right, 0px)) calc(84px + env(
 /* Bottom tab bar */
 nav.tabbar {
   position: fixed; left: 0; right: 0; bottom: 0; z-index: 15; background: var(--surface); border-top: 1px solid var(--line);
-  display: grid; grid-template-columns: repeat(3, 1fr);
+  display: grid; grid-template-columns: repeat(4, 1fr);
   padding: 6px max(8px, env(safe-area-inset-right, 0px)) calc(6px + env(safe-area-inset-bottom, 0px)) max(8px, env(safe-area-inset-left, 0px));
 }
 nav.tabbar button { border: 0; background: none; color: var(--muted); font: 600 11px var(--font); display: grid; justify-items: center; gap: 2px; padding: 4px 0; cursor: pointer; }
@@ -140,6 +140,9 @@ fieldset.add legend { font-weight: 700; padding: 0 4px; }
 .wsum .big { display: block; font-size: 26px; font-weight: 750; font-variant-numeric: tabular-nums; }
 .wsum .lbl { font-size: 12px; color: var(--muted); font-weight: 600; }
 .cv-head { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+.scanbox { display: grid; gap: 12px; justify-items: center; text-align: center; }
+.scanbtn { width: 100%; display: block; text-align: center; padding: 14px; font-size: 17px; }
+.scanprev { max-height: 260px; border-radius: 10px; object-fit: contain; }
 .lang-chip { background: var(--accent); color: var(--accent-fg); }
 .dir { font-variant-numeric: tabular-nums; font-size: 13px; font-weight: 700; }
 .dir.up { color: var(--up); } .dir.down { color: var(--down); } .dir.flat, .dir.none { color: var(--muted); }
@@ -173,6 +176,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible
 <nav class="tabbar" aria-label="Bereiche">
   <button id="tab-search" aria-pressed="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>Suche</button>
   <button id="tab-coll" aria-pressed="false"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><rect x="4" y="3" width="12" height="16" rx="2"/><path d="M8 21h10a2 2 0 0 0 2-2V7"/></svg>Sammlung</button>
+  <button id="tab-scan" aria-pressed="false"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><path d="M4 8h3l2-3h6l2 3h3v11H4z"/><circle cx="12" cy="13" r="3.5"/></svg>Scannen</button>
   <button id="tab-watch" aria-pressed="false"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><path d="M6 3h12v18l-6-4-6 4z"/></svg>Merkliste</button>
 </nav>
 <div class="sheet-bg" id="sheet-bg" hidden></div>
@@ -918,7 +922,7 @@ function closeSheet() { $("sheet").hidden = true; $("sheet-bg").hidden = true; }
 $("sheet-bg").onclick = closeSheet;
 document.addEventListener("keydown", e => { if (e.key === "Escape") closeSheet(); });
 
-async function openCardSheet(id, lang) {
+async function openCardSheet(id, lang, preferLang) {
   showSheet(`<p class="meta">Lade Karte…</p>`);
   const c = await getCard(id, lang);
   if (!c) { showSheet(`<button class="close" aria-label="Schließen">×</button><p>Diese Karte konnte nicht geladen werden.</p>`); return; }
@@ -928,7 +932,7 @@ async function openCardSheet(id, lang) {
     ["Ø 7 Tage", cm.avg7], ["Ø 30 Tage", cm.avg30],
     ["Ab-Preis Holo/Reverse", cm["low-holo"]], ["Trend Holo/Reverse", cm["trend-holo"]],
   ].filter(([, v]) => num(v)) : [];
-  const defLang = lang === "en" ? "en" : "de";
+  const defLang = (preferLang && LANGS[preferLang]) ? preferLang : (lang === "en" ? "en" : "de");
   const isSaved = (cl) => watch.some(w => w.id === c.id && (w.cardLang || w.lang) === cl);
   const owned = coll.filter(e => e.id === c.id).reduce((s, e) => s + e.qty, 0);
   showSheet(`
@@ -945,7 +949,7 @@ async function openCardSheet(id, lang) {
     ${rows.length ? `<table>${rows.map(([k, v]) => `<tr><td>${k}</td><td>${eur(v)}</td></tr>`).join("")}</table>` : `<p class="note">Für diese Karte liegen keine Cardmarket-Preise vor.</p>`}
     <p class="note">Cardmarket fasst diese Preise über alle Sprachen und Zustände zusammen${cm?.updated ? ", Stand " + new Date(cm.updated).toLocaleDateString("de-DE") : ""}.</p>
     <fieldset class="add"><legend>Zur Sammlung hinzufügen</legend>
-      ${formHtml({ qty: 1, cardLang: lang === "en" ? "en" : "de", cond: "NM", variant: "normal" }, cm)}
+      ${formHtml({ qty: 1, cardLang: defLang, cond: "NM", variant: "normal" }, cm)}
       <button class="btn" id="add">Zur Sammlung hinzufügen</button>
     </fieldset>
     <div class="actions">
@@ -1028,6 +1032,197 @@ async function openEntrySheet(uid) {
   };
 }
 
+/* ---------- Karten-Scan per Foto ---------- */
+// Texterkennung (Tesseract) läuft komplett auf dem Gerät; Skript und Sprachdaten werden beim ersten Scan geladen.
+const TESS_SRC = "https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js";
+let tessWorker = null;
+const scan = { img: null, fields: null, cands: null, msg: "", busy: false, text: "" };
+function loadScript(src) {
+  return new Promise((res, rej) => { const s = document.createElement("script"); s.src = src; s.onload = res; s.onerror = () => rej(new Error("script")); document.head.appendChild(s); });
+}
+async function getTess(onProgress) {
+  if (tessWorker) return tessWorker;
+  if (!window.Tesseract) await loadScript(TESS_SRC);
+  tessWorker = await Tesseract.createWorker(["eng", "deu"], 1, {
+    logger: m => { if (m.status && typeof m.progress === "number") onProgress?.(m.status, m.progress); }
+  });
+  return tessWorker;
+}
+// Foto verkleinern (und optional nur einen Ausschnitt vergrößern) für die Texterkennung
+async function imageCanvas(file, crop) {
+  const bmp = await createImageBitmap(file);
+  const maxW = crop ? 2400 : 1800;
+  const sx = 0, sy = crop ? Math.round(bmp.height * (1 - crop)) : 0, sw = bmp.width, sh = crop ? bmp.height - sy : bmp.height;
+  const scale = Math.min(1, maxW / sw) * (crop ? 1.6 : 1);
+  const c = document.createElement("canvas");
+  c.width = Math.round(sw * scale); c.height = Math.round(sh * scale);
+  const g = c.getContext("2d");
+  g.filter = "grayscale(1) contrast(1.35)";
+  g.drawImage(bmp, sx, sy, sw, sh, 0, 0, c.width, c.height);
+  return c;
+}
+const LANG_TOKENS = { EN: "en", DE: "de", FR: "fr", IT: "it", ES: "es", PT: "pt", JP: "ja", KO: "ko" };
+const fixDigits = (s) => s.replace(/[Oo]/g, "0").replace(/[Il|]/g, "1").replace(/S/g, "5").replace(/B/g, "8");
+// Liest aus dem erkannten Text Name, Kartennummer, Gesamtzahl, Setkürzel und Sprache
+function parseCardText(text) {
+  const lines = text.split(/\n+/).map(l => l.trim()).filter(Boolean);
+  const r = { name: "", number: "", total: "", code: "", lang: "" };
+  // Nummer wie „154/128“, „TG05/TG30“, „GG01/GG70“
+  for (const l of lines) {
+    const m = l.match(/\b([A-Z]{2})?([0-9OoIlSB|]{1,3})\s*\/\s*([A-Z]{2})?([0-9OoIlSB|]{2,3})\b/);
+    if (m) {
+      r.number = (m[1] || "") + fixDigits(m[2]); r.total = fixDigits(m[4]);
+      // Setkürzel und Sprachkennung stehen auf neueren Karten in derselben Zeile („30C DE 154/128“)
+      const before = l.slice(0, m.index).toUpperCase().split(/[^A-Z0-9]+/).filter(Boolean);
+      for (const t of before.reverse()) {
+        if (!r.lang && LANG_TOKENS[t]) { r.lang = LANG_TOKENS[t]; continue; }
+        if (!r.code && /^[A-Z0-9]{2,4}$/.test(t) && /[A-Z]/.test(t) && !LANG_TOKENS[t] && !["HP", "KP", "PV", "PS"].includes(t)) r.code = t;
+      }
+      break;
+    }
+  }
+  if (!r.number) { // Promo-Karten wie „SVP 027“
+    const m = text.match(/\b(SVP|SWSH|SM|XY|BW|MEP)\s?([0-9]{2,3})\b/);
+    if (m) { r.code = m[1]; r.number = m[2]; }
+  }
+  // Sprache aus der KP/HP-Angabe: KP = Deutsch, PV = Französisch/Italienisch, PS = Spanisch, HP = Englisch
+  if (!r.lang) {
+    if (/\bKP\s*\d/.test(text)) r.lang = "de";
+    else if (/\bPV\s*\d/.test(text)) r.lang = "fr";
+    else if (/\bPS\s*\d/.test(text)) r.lang = "es";
+    else if (/\bHP\s*\d/.test(text)) r.lang = "en";
+  }
+  // Name: Text vor der KP/HP-Angabe, sonst erste sinnvolle Zeile
+  const skip = /^(BASIS|BASIC|PHASE|STAGE|STUFE|BASE|ENTWICKLUNG|TRAINER|ENERGIE|ENERGY|ITEM|ARTIKEL|UNTERSTÜTZUNG|SUPPORTER)\b/i;
+  const hpLine = lines.find(l => /\b(KP|HP|PV|PS)\s*\d{2,3}/.test(l));
+  let name = hpLine ? hpLine.replace(/\b(KP|HP|PV|PS)\s*\d{2,3}.*$/, "") : (lines.find(l => /[A-Za-zÄÖÜäöü]{3,}/.test(l) && !skip.test(l)) || "");
+  name = name.replace(skip, "").replace(/[^A-Za-zÄÖÜäöüß0-9\-\s'.]/g, " ").replace(/\s+/g, " ").trim();
+  r.name = name.split(" ").slice(0, 4).join(" ");
+  return r;
+}
+// Ähnlichkeit zweier Namen 0..1 (Bigramme), robust gegen kleine Lesefehler
+function nameSim(a, b) {
+  a = norm(a); b = norm(b); if (!a || !b) return 0;
+  if (a === b || b.includes(a) || a.includes(b)) return 1;
+  const bg = (s) => { const m = new Map(); for (let i = 0; i < s.length - 1; i++) { const k = s.slice(i, i + 2); m.set(k, (m.get(k) || 0) + 1); } return m; };
+  const A = bg(a), B = bg(b); let hit = 0;
+  A.forEach((v, k) => { hit += Math.min(v, B.get(k) || 0); });
+  return 2 * hit / Math.max(1, a.length - 1 + b.length - 1);
+}
+const sameNum = (a, b) => String(a).replace(/^([A-Z]*)0+/i, "$1").toLowerCase() === String(b).replace(/^([A-Z]*)0+/i, "$1").toLowerCase();
+// Ordnet die gelesenen Angaben einer Karte in der Datenbank zu
+async function identifyCard(f) {
+  const out = new Map();
+  const add = (c, score) => { const p = out.get(c.id); if (!p || p.score < score) out.set(c.id, { ...c, score }); };
+  const sets = await allSets();
+  let cand = [];
+  if (f.code) {
+    for (const l of [state.lang, OTHER(state.lang)]) {
+      const s = await findSet(f.code, l, false) || await findSet(f.code, l, true);
+      if (s) { cand.push(...await setGroup(s)); break; }
+    }
+  }
+  if (f.total) {
+    const L = state.lang, O = OTHER(L);
+    const [a, b] = await Promise.all([getSets(L), getSets(O)]);
+    const byTotal = [...a, ...b].filter(s => String(s.cardCount?.official) === String(parseInt(f.total, 10)));
+    const ids = new Set(cand.map(s => s.id));
+    // Kürzel und Gesamtzahl passen zusammen: nur diese Sets; sonst beide Listen
+    const both = byTotal.filter(s => ids.has(s.id));
+    cand = both.length ? both : [...cand, ...byTotal];
+  }
+  const seen = new Set(); cand = cand.filter(s => !seen.has(s.id) && seen.add(s.id)).slice(0, 15);
+  if (f.number && cand.length) {
+    const lists = await Promise.all(cand.map(s => setCards(s.id)));
+    lists.forEach(list => (list || []).forEach(c => { if (sameNum(c.localId, f.number)) add(c, 1 + (f.name ? nameSim(f.name, c.name) : 0)); }));
+  }
+  if (!out.size && f.name) {
+    const hits = await nameSearch(f.name).catch(() => []);
+    hits.slice(0, 60).forEach(c => add(c, nameSim(f.name, c.name) + (f.number && sameNum(c.localId, f.number) ? 1 : 0)));
+  }
+  // Namen in der anderen Sprache prüfen, wenn die Nummer mehrere Treffer liefert
+  const list = [...out.values()].sort((x, y) => y.score - x.score);
+  return list.slice(0, 24);
+}
+function scanFieldsHtml(f) {
+  return `<fieldset class="add"><legend>Erkannte Angaben (bei Bedarf korrigieren)</legend>
+    <div class="fields">
+      <label style="grid-column:1/-1">Name<input id="s-name" type="text" value="${esc(f.name)}" placeholder="z. B. Gengar-ex"></label>
+      <label>Kartennummer<input id="s-num" type="text" value="${esc(f.number)}" placeholder="z. B. 154"></label>
+      <label>von (Gesamtzahl)<input id="s-total" type="text" inputmode="numeric" value="${esc(f.total)}" placeholder="z. B. 128"></label>
+      <label>Setkürzel<input id="s-code" type="text" value="${esc(f.code)}" placeholder="z. B. 30C"></label>
+      <label>Sprache der Karte<select id="s-lang"><option value="">unbekannt</option>${Object.entries(LANGS).map(([k, v]) => `<option value="${k}"${k === f.lang ? " selected" : ""}>${esc(v)}</option>`).join("")}</select></label>
+    </div>
+    <button class="btn" id="s-search">Mit diesen Angaben suchen</button>
+  </fieldset>`;
+}
+function renderScan() {
+  $("status").textContent = "";
+  $("view").innerHTML = `
+    <div class="panel scanbox">
+      <label class="btn scanbtn" for="s-file">${scan.img ? "Neues Foto aufnehmen" : "Karte fotografieren"}</label>
+      <input id="s-file" type="file" accept="image/*" capture="environment" hidden>
+      ${scan.img ? `<img class="scanprev" alt="Dein Foto" src="${scan.img}">` : `<p class="note" style="margin:0">Fotografiere die Karte gerade von vorn, gut beleuchtet und ohne Spiegelung, sodass sie das Bild möglichst ausfüllt. Wichtig ist, dass unten die Kartennummer (z. B. 154/128) und das Setkürzel lesbar sind. Die Erkennung läuft auf deinem Gerät.</p>`}
+      ${scan.msg ? `<p class="note scanmsg">${esc(scan.msg)}</p>` : ""}
+    </div>
+    ${scan.fields ? scanFieldsHtml(scan.fields) : ""}
+    ${scan.cands ? `<h2 class="section">${scan.cands.length === 1 ? "Erkannte Karte" : scan.cands.length ? `${scan.cands.length} mögliche Karten, tippe auf die richtige` : "Keine passende Karte gefunden"}</h2><div class="grid" id="s-grid"></div>` : ""}`;
+  $("s-file").addEventListener("change", e => { const f = e.target.files?.[0]; if (f) runScan(f); });
+  if (scan.fields) $("s-search").onclick = () => {
+    scan.fields = { name: $("s-name").value.trim(), number: $("s-num").value.trim(), total: $("s-total").value.trim(), code: $("s-code").value.trim().toUpperCase(), lang: $("s-lang").value };
+    runIdentify();
+  };
+  if (scan.cands?.length) {
+    const grid = $("s-grid");
+    scan.cands.forEach(c => { const t = cardTile(c, null); t.onclick = () => openCardSheet(c.id, c.lang || state.lang, scan.fields?.lang); grid.appendChild(t);
+      getCard(c.id, c.lang || state.lang).then(full => { if (full && document.contains(t)) { const n = cardTile(c, full); n.onclick = t.onclick; t.replaceWith(n); } }); });
+  }
+}
+async function runScan(file) {
+  if (scan.busy) return;
+  scan.busy = true; scan.cands = null; scan.fields = null;
+  try { if (scan.img) URL.revokeObjectURL(scan.img); } catch {}
+  scan.img = URL.createObjectURL(file);
+  scan.msg = "Texterkennung wird geladen…"; renderScan();
+  const say = (t) => { scan.msg = t; const el = document.querySelector(".scanmsg"); if (el) el.textContent = t; };
+  try {
+    const w = await getTess((st, p) => { if (/load|init/i.test(st)) say(`Texterkennung wird geladen… ${Math.round(p * 100)} %`); else if (/recogn/i.test(st)) say(`Lese die Karte… ${Math.round(p * 100)} %`); });
+    say("Lese die Karte…");
+    const full = await w.recognize(await imageCanvas(file));
+    let f = parseCardText(full.data.text);
+    if (!f.number) { // zweiter Versuch: unteres Drittel vergrößert, dort stehen Nummer und Setkürzel
+      const bottom = await w.recognize(await imageCanvas(file, 0.35));
+      const b = parseCardText(bottom.data.text);
+      f = { ...f, number: b.number || f.number, total: b.total || f.total, code: f.code || b.code, lang: f.lang || b.lang };
+    }
+    scan.text = full.data.text;
+    scan.fields = f;
+    await runIdentify(true);
+  } catch (e) {
+    scan.msg = "Die Texterkennung konnte nicht geladen werden. Prüfe deine Internetverbindung und versuche es noch einmal.";
+    scan.fields = scan.fields || { name: "", number: "", total: "", code: "", lang: "" };
+    renderScan();
+  } finally { scan.busy = false; }
+}
+async function runIdentify(fromPhoto) {
+  const f = scan.fields;
+  if (!f.name && !f.number) { scan.cands = []; scan.msg = "Auf dem Foto war weder Name noch Kartennummer lesbar. Versuch ein schärferes Foto oder trag die Angaben unten selbst ein."; renderScan(); return; }
+  scan.msg = "Suche die Karte in der Datenbank…"; renderScan();
+  try {
+    const list = await identifyCard(f);
+    scan.cands = list;
+    const sure = list.length === 1 || (list.length > 1 && list[0].score >= 1.6 && list[1].score < list[0].score - 0.3);
+    scan.msg = !list.length ? "Keine passende Karte gefunden. Prüf die erkannten Angaben unten und such erneut."
+      : sure ? `Erkannt: ${list[0].name}${f.number ? " · Nr. " + f.number : ""}${f.lang ? " · " + LANGS[f.lang] : ""}.`
+      : "Die Angaben passen auf mehrere Karten. Tippe unten auf die richtige.";
+    if (sure) scan.cands = [list[0]];
+    renderScan();
+    if (sure && fromPhoto && state.view === "scan") openCardSheet(list[0].id, list[0].lang || state.lang, f.lang);
+  } catch {
+    scan.msg = "Die Kartendatenbank ist gerade nicht erreichbar. Versuch es gleich noch einmal."; renderScan();
+  }
+}
+
 /* ---------- Navigation ---------- */
 function setLang(l) {
   state.lang = l; store.set("lang", l);
@@ -1039,14 +1234,15 @@ function setLang(l) {
 }
 async function setView(v) {
   state.view = v;
-  ["search", "coll", "watch"].forEach(k => $("tab-" + k).setAttribute("aria-pressed", k === v));
+  ["search", "coll", "watch", "scan"].forEach(k => $("tab-" + k).setAttribute("aria-pressed", k === v));
   $("search-form").hidden = v !== "search";
   $("lang-row").hidden = v !== "search";
   $("set-pick").hidden = v !== "search";
-  $("title").textContent = { search: "Kartenpreise", coll: "Meine Sammlung", watch: "Merkliste" }[v];
+  $("title").textContent = { search: "Kartenpreise", coll: "Meine Sammlung", watch: "Merkliste", scan: "Karte scannen" }[v];
   window.scrollTo(0, 0);
   if (v === "watch") { renderWatch(); if (watch.length && await refreshWatch() && state.view === "watch") renderWatch(); }
   else if (v === "coll") { renderColl(); if (coll.length && await refreshPrices() && state.view === "coll") renderColl(); }
+  else if (v === "scan") renderScan();
   else search(state.query);
 }
 $("lang-de").onclick = () => setLang("de");
@@ -1054,6 +1250,7 @@ $("lang-en").onclick = () => setLang("en");
 $("tab-search").onclick = () => setView("search");
 $("tab-coll").onclick = () => setView("coll");
 $("tab-watch").onclick = () => setView("watch");
+$("tab-scan").onclick = () => setView("scan");
 $("set-pick").addEventListener("change", () => search($("q").value));
 $("search-form").addEventListener("submit", e => { e.preventDefault(); $("q").blur(); search($("q").value.trim()); });
 
