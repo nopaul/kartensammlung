@@ -871,7 +871,8 @@ function renderColl() {
       <div class="panel tile"><p class="label">Investiert</p><div class="value">${eur(invested)}</div><div class="sub">${bought.length} von ${coll.length} Einträgen</div></div>
       <div class="panel tile"><p class="label">Gewinn / Verlust</p><div class="value dir ${pl >= 0 ? "down" : "up"}" style="font-size:20px">${pl >= 0 ? "+" : "−"}${eur(Math.abs(pl)) === "–" ? "0,00 €" : eur(Math.abs(pl))}</div><div class="sub">${pct(invested ? pl / invested * 100 : 0)} seit Kauf</div></div>
     </div>` : `<p class="note" style="margin:0">Tipp: Trag bei deinen Karten den Kaufpreis ein (Karte antippen), dann siehst du hier Gewinn und Verlust seit dem Kauf.</p>`}
-    <div class="panel"><h3>Wertentwicklung</h3>${collChartHtml(total, bought.length === coll.length ? invested : null)}</div>
+    <div class="panel"><h3>Wertentwicklung</h3>${collChartHtml(total, bought.length === coll.length ? invested : null)}
+      ${collHist.length ? `<button class="btn danger" id="hist-reset" style="width:100%;margin-top:10px">Verlauf zurücksetzen</button>` : ""}</div>
     <div class="tiles">
       <div class="panel tile"><p class="label">Wertvollste Karte</p><div class="value">${eur(unitValue(best))}</div><div class="sub">${esc(best.name)}</div></div>
       <div class="panel tile"><p class="label">Ø pro Karte</p><div class="value">${eur(count ? total / count : 0)}</div><div class="sub">über alle Exemplare</div></div>
@@ -886,6 +887,16 @@ function renderColl() {
   <h2 class="section">Deine Karten</h2>
   <div class="list" id="entries"></div>`;
   wireChart($("view").querySelector(".panel .chartbox")?.parentElement || $("view"), collHist);
+  const hr = $("hist-reset");
+  if (hr) { let armed = false; hr.onclick = () => {
+    if (!armed) { armed = true; hr.textContent = "Wirklich? Alle Messpunkte werden gelöscht. Nochmal tippen"; return; }
+    // Neustart: alter Verlauf weg, sofort ein frischer Messpunkt mit dem aktuellen Wert
+    collHist = []; store.set("collHist", collHist);
+    const total = coll.reduce((s, e) => s + entryValue(e), 0);
+    if (total > 0) { const parts = {}; coll.forEach(e => { const v = entryValue(e); if (v > 0) parts[e.uid] = Math.round(v * 100) / 100; });
+      collHist.push({ d: new Date().toISOString(), p: Math.round(total * 100) / 100, e: parts }); store.set("collHist", collHist); }
+    renderColl(); toast("Verlauf zurückgesetzt");
+  }; }
   const list = $("entries");
   sorted.forEach(e => {
     const b = document.createElement("button"); b.className = "entry"; b.type = "button";
