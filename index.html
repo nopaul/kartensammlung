@@ -41,6 +41,8 @@ header {
 h1 { font-size: 20px; margin: 0; letter-spacing: .2px; }
 form.search { display: flex; gap: 8px; }
 input, select { font: 16px var(--font); }
+#set-pick { width: 100%; padding: 9px 12px; border-radius: 10px; border: 0; background: rgba(255,255,255,.14); color: var(--head-fg); font: 15px var(--font); }
+#set-pick option { color: #121826; background: #fff; }
 input[type=search] { flex: 1; min-width: 0; padding: 10px 12px; border-radius: 10px; border: 0; background: #fff; color: #121826; }
 .btn { border: 0; border-radius: 10px; background: var(--accent); color: var(--accent-fg); font: 600 15px var(--font); padding: 11px 14px; cursor: pointer; }
 .lang { display: flex; gap: 6px; align-items: center; font-size: 13px; opacity: .9; }
@@ -158,6 +160,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible
     <input id="q" type="search" placeholder="Kartenname, z. B. Glurak 30c" autocomplete="off" enterkeyhint="search">
     <button class="btn" type="submit">Suchen</button>
   </form>
+  <select id="set-pick" aria-label="Set auswählen"><option value="">Alle Sets</option></select>
   <div class="lang" id="lang-row">Kartennamen:
     <button id="lang-de" aria-pressed="true">Deutsch</button>
     <button id="lang-en" aria-pressed="false">Englisch</button>
@@ -268,6 +271,7 @@ function cardTile(brief, full) {
     <div class="info">
       <div class="name">${esc(brief.name)}</div>
       <div class="set">${full ? esc(`${full.set?.name ?? ""} · ${full.localId}`) : esc(`Nr. ${brief.localId ?? ""}`)}</div>
+      ${full?.rarity ? `<div class="set">${esc(full.rarity)}${brief.lang && brief.lang !== state.lang ? " · nur " + (brief.lang === "en" ? "EN" : "DE") : ""}</div>` : ""}
       <div class="price">${full ? `ab ${eur(lowPrice(cm))} <small>· Trend ${eur(trendPrice(cm))}</small>` : "<small>Preis wird geladen…</small>"}</div>
     </div>`;
   b.addEventListener("click", () => openCardSheet(brief.id, brief.lang || state.lang));
@@ -353,46 +357,160 @@ async function cardsOfSet(setId, lang) {
   return cache.get(key);
 }
 
+/* ---------- Suche über beide Sprachen ---------- */
+const OTHER = (l) => l === "de" ? "en" : "de";
+async function fetchPages(url) {
+  const out = [];
+  for (let page = 1; page <= 4; page++) {
+    const r = await fetch(`${url}&pagination:page=${page}&pagination:itemsPerPage=100`);
+    if (!r.ok) { if (page === 1) throw new Error(r.status); break; }
+    const part = await r.json();
+    if (!Array.isArray(part)) break;
+    out.push(...part);
+    if (part.length < 100) break;
+  }
+  return out;
+}
+// Führt Trefferlisten aus beiden Sprachen über die Karten-ID zusammen; die eingestellte Sprache hat Vorrang
+function mergeById(primary, secondary) {
+  const m = new Map();
+  primary.forEach(c => m.set(c.id, c));
+  secondary.forEach(c => { if (!m.has(c.id)) m.set(c.id, c); });
+  return [...m.values()];
+}
+async function nameSearch(q) {
+  const L = state.lang, O = OTHER(L);
+  const enc = encodeURIComponent(q);
+  // 1) Name in beiden Datenbanken suchen (für Namen wie „Pikachu“, die in beiden Sprachen gleich sind)
+  const [a, b] = await Promise.all([
+    fetchPages(`${API}/${L}/cards?name=${enc}`).catch(() => null),
+    fetchPages(`${API}/${O}/cards?name=${enc}`).catch(() => [])
+  ]);
+  if (a === null) throw new Error("api");
+  let list = mergeById(a.map(c => ({ ...c, lang: L })), b.map(c => ({ ...c, lang: O })));
+  // 2) Übersetzen über die Pokédex-Nummer: Treffer der einen Sprache finden dieselben Pokémon in der anderen,
+  //    so fehlen keine Karten, die es nur in einer Sprachdatenbank gibt
+  const seeds = list.slice(0, 8);
+  const dex = new Set();
+  await Promise.all(seeds.map(async c => { const f = await getCard(c.id, c.lang); (f?.dexId || []).forEach(d => dex.add(d)); }));
+  if (dex.size && dex.size <= 3) {
+    const extra = await Promise.all([...dex].flatMap(d => [L, O].map(async l => {
+      const r = await fetchPages(`${API}/${l}/cards?dexId=eq:${d}`).catch(() => []);
+      // Sicherheitsprüfung: Stichprobe muss wirklich diese Pokédex-Nummer haben, sonst Ergebnis verwerfen
+      const probe = await Promise.all(r.slice(0, 2).map(c => getCard(c.id, l)));
+      if (!r.length || probe.some(f => !(f?.dexId || []).includes(d))) return [];
+      return r.map(c => ({ ...c, lang: l }));
+    })));
+    // nur Karten übernehmen, deren Name zum Suchbegriff passt (z. B. „Glurak ex“ soll kein „Glurak VMAX“ liefern)
+    const words = q.toLowerCase().split(/[\s\-]+/).slice(1).map(norm).filter(Boolean);
+    const fit = (c) => !words.length || words.every(w => norm(c.name).includes(w));
+    const all = extra.flat().filter(fit);
+    const pri = all.filter(c => c.lang === L), sec = all.filter(c => c.lang === O);
+    list = mergeById(mergeById(list.filter(c => c.lang === L), pri), mergeById(list.filter(c => c.lang === O), sec));
+  }
+  return list;
+}
+async function setCards(setId) {
+  const L = state.lang, O = OTHER(L);
+  const [a, b] = await Promise.all([cardsOfSet(setId, L), cardsOfSet(setId, O)]);
+  if (!a && !b) return null;
+  return mergeById((a?.cards || []).map(c => ({ ...c, lang: L })), (b?.cards || []).map(c => ({ ...c, lang: O })));
+}
+
+// Seltenheit als Rangzahl (deutsch und englisch), höher = seltener
+const RARITY_RANK = [
+  [/mega hyper/, 100], [/hyper/, 95], [/special illustration|spezielle illustration|besondere illustration/, 90],
+  [/secret|geheim/, 88], [/rainbow|regenbogen/, 87], [/gold/, 86], [/black white|schwarz.?weiss/, 85],
+  [/shiny ultra|schillernde ultra/, 82], [/ultra/, 80], [/illustration/, 75], [/ace spec/, 70],
+  [/shiny|schillernd/, 68], [/amazing|radiant|strahlend|fantastisch/, 65],
+  [/vmax|vstar|double|doppel/, 60], [/holo v\b|rare v\b/, 58], [/prime|legend|break|full art/, 55],
+  [/holo/, 40], [/uncommon|nicht so haufig/, 20], [/common|haufig/, 10], [/rare|selten/, 30]
+];
+function rarityRank(r) {
+  const s = String(r || "").toLowerCase().normalize("NFD").replace(/[̀-ͯ]/g, "");
+  if (!s || s === "none") return 5;
+  for (const [re, v] of RARITY_RANK) if (re.test(s)) return v;
+  return 25;
+}
+const localNum = (id) => parseInt(String(id).replace(/\D/g, ""), 10) || 0;
+
 async function search(q) {
+  q = (q || "").trim();
   state.query = q;
   const status = $("status");
-  if (!q) { status.textContent = ""; $("view").innerHTML = `<p class="empty">Gib einen Kartennamen ein, zum Beispiel „Glurak“, „Pikachu“ oder „Mewtu“. Mit Setkürzel dahinter grenzt du auf ein Set ein, etwa „Glurak 30c“ oder „Pikachu MEW“.</p>`; return; }
+  const setId = $("set-pick").value;
+  if (!q && !setId) { status.textContent = ""; $("view").innerHTML = `<p class="empty">Gib einen Kartennamen ein oder wähle oben ein Set, zum Beispiel „Glurak“, „Glurak 30c“ oder nur das Set „30th Celebration“.</p>`; return; }
   status.textContent = "Suche läuft…"; $("view").innerHTML = "";
-  const myQuery = q;
+  const token = state.token = {};
   try {
-    const pq = await parseQuery(q, state.lang);
-    let list = [];
-    if (pq.set) {
-      const sd = await cardsOfSet(pq.set.id, pq.setLang);
-      if (!sd) throw new Error("set");
-      const n = norm(pq.name);
-      list = (sd.cards || []).map(c => ({ ...c, lang: pq.setLang })).filter(c => (!n || norm(c.name).includes(n)) && (!pq.number || String(c.localId).replace(/^0+/, "").toLowerCase() === pq.number.replace(/^0+/, "").toLowerCase()));
-      if (!list.length) pq.set = null; // kein Treffer im Set: normal nach dem ganzen Text suchen
+    let list, label, set = null, number = null, name = q;
+    if (setId) {
+      set = (await allSets()).find(s => s.id === setId) || { id: setId, name: setId };
+    } else {
+      const pq = await parseQuery(q, state.lang);
+      if (pq.set) { set = pq.set; name = pq.name; number = pq.number; }
     }
-    if (!pq.set) {
-      for (let page = 1; page <= 4; page++) {
-        const r = await fetch(`${API}/${state.lang}/cards?name=${encodeURIComponent(q)}&pagination:page=${page}&pagination:itemsPerPage=100`);
-        if (!r.ok) throw new Error(r.status);
-        const part = await r.json();
-        list.push(...part);
-        if (part.length < 100) break;
-      }
-    }
+    if (set) {
+      const cards = await setCards(set.id);
+      if (!cards) throw new Error("set");
+      const n = norm(name);
+      // Name auch sprachübergreifend erkennen: Karten-IDs aus der normalen Suche (z. B. „Glurak“ findet „Charizard“)
+      const ids = n ? new Set((await nameSearch(name).catch(() => [])).map(c => c.id)) : null;
+      list = cards.filter(c => (!n || norm(c.name).includes(n) || ids.has(c.id)) && (!number || String(c.localId).replace(/^0+/, "").toLowerCase() === number.replace(/^0+/, "").toLowerCase()));
+      if (!list.length && !setId) { set = null; list = await nameSearch(q); }
+    } else list = await nameSearch(q);
     list = list.filter(c => c.image);
-    if (state.view !== "search" || state.query !== myQuery) return;
-    const label = pq.set ? `„${pq.name || "alle Karten"}“ im Set ${pq.set.name}${pq.number ? ", Nr. " + pq.number : ""}` : `„${q}“`;
-    if (!list.length) {
-      status.textContent = `Keine Karten zu ${label} gefunden. Prüfe die Schreibweise oder stell die Kartennamen auf ${state.lang === "de" ? "Englisch" : "Deutsch"} um, manche neuen Sets gibt es in der Datenbank nur auf Englisch.`;
-      return;
+    if (state.token !== token) return;
+    label = set ? `${name ? "„" + name + "“ im Set " : "Set "}${set.name}${number ? ", Nr. " + number : ""}` : `„${q}“`;
+    if (!list.length) { status.textContent = `Keine Karten zu ${label} gefunden. Prüfe die Schreibweise.`; return; }
+    if (set) {
+      // nach Seltenheit sortieren: dafür die Details aller Karten laden
+      let done = 0;
+      status.textContent = `${list.length} Karten in ${set.name}. Sortiere nach Seltenheit… 0/${list.length}`;
+      let i = 0;
+      const full = new Array(list.length);
+      async function worker() {
+        while (i < list.length) {
+          const k = i++;
+          full[k] = await getCard(list[k].id, list[k].lang);
+          done++;
+          if (state.token === token && done % 10 === 0) status.textContent = `${list.length} Karten in ${set.name}. Sortiere nach Seltenheit… ${done}/${list.length}`;
+        }
+      }
+      await Promise.all(Array.from({ length: 10 }, worker));
+      if (state.token !== token) return;
+      list = list.map((c, k) => ({ ...c, rarity: full[k]?.rarity, rank: rarityRank(full[k]?.rarity) }))
+        .sort((x, y) => y.rank - x.rank || localNum(y.localId) - localNum(x.localId));
     }
-    status.textContent = `${list.length} Karten zu ${label}${pq.set && pq.setLang !== state.lang ? " (Set nur auf " + (pq.setLang === "en" ? "Englisch" : "Deutsch") + " in der Datenbank)" : ""}. Preise von Cardmarket.`;
+    status.textContent = `${list.length} Karten zu ${label}${set ? ", seltenste zuerst" : ""}. Preise von Cardmarket.`;
     state.results = list; state.shown = 0;
     $("view").replaceChildren();
     showMore();
   } catch {
-    status.textContent = "Die Kartendatenbank ist gerade nicht erreichbar. Prüfe deine Internetverbindung und versuche es noch einmal.";
+    if (state.token === token) status.textContent = "Die Kartendatenbank ist gerade nicht erreichbar. Prüfe deine Internetverbindung und versuche es noch einmal.";
   }
 }
+
+// Setliste für das Auswahlfeld: beide Sprachen zusammengeführt, neueste zuerst
+let setsMerged = null;
+async function allSets() {
+  if (setsMerged) return setsMerged;
+  const L = state.lang, O = OTHER(L);
+  const [a, b] = await Promise.all([getSets(L), getSets(O)]);
+  const m = new Map();
+  (b || []).forEach((s, i) => m.set(s.id, { id: s.id, name: s.name, order: i }));
+  (a || []).forEach((s, i) => m.set(s.id, { id: s.id, name: s.name, order: m.get(s.id)?.order ?? i }));
+  setsMerged = [...m.values()].sort((x, y) => y.order - x.order);
+  if (!setsMerged.length) setsMerged = null;
+  return setsMerged || [];
+}
+async function fillSetPicker() {
+  const sel = $("set-pick"), keep = sel.value;
+  const sets = await allSets();
+  sel.innerHTML = `<option value="">Alle Sets</option>` + sets.map(s => `<option value="${esc(s.id)}">${esc(s.name)}</option>`).join("");
+  if (keep && sets.some(s => s.id === keep)) sel.value = keep;
+}
+
 // Ergebnisse in Blöcken anzeigen, Preise werden pro Block nachgeladen
 function showMore() {
   const items = state.results.slice(state.shown, state.shown + PAGE);
@@ -874,13 +992,15 @@ function setLang(l) {
   $("lang-de").setAttribute("aria-pressed", l === "de");
   $("lang-en").setAttribute("aria-pressed", l === "en");
   $("q").placeholder = l === "de" ? "Kartenname, z. B. Glurak 30c" : "Card name, e.g. Charizard 30c";
-  if (state.view === "search" && state.query) search(state.query);
+  setsMerged = null; fillSetPicker(); // Setnamen in der gewählten Sprache
+  if (state.view === "search" && (state.query || $("set-pick").value)) search(state.query);
 }
 async function setView(v) {
   state.view = v;
   ["search", "coll", "watch"].forEach(k => $("tab-" + k).setAttribute("aria-pressed", k === v));
   $("search-form").hidden = v !== "search";
   $("lang-row").hidden = v !== "search";
+  $("set-pick").hidden = v !== "search";
   $("title").textContent = { search: "Kartenpreise", coll: "Meine Sammlung", watch: "Merkliste" }[v];
   window.scrollTo(0, 0);
   if (v === "watch") { renderWatch(); if (watch.length && await refreshWatch() && state.view === "watch") renderWatch(); }
@@ -892,6 +1012,7 @@ $("lang-en").onclick = () => setLang("en");
 $("tab-search").onclick = () => setView("search");
 $("tab-coll").onclick = () => setView("coll");
 $("tab-watch").onclick = () => setView("watch");
+$("set-pick").addEventListener("change", () => search($("q").value));
 $("search-form").addEventListener("submit", e => { e.preventDefault(); $("q").blur(); search($("q").value.trim()); });
 
 setLang(state.lang);
