@@ -813,14 +813,15 @@ async function recordCollValue() {
   store.set("collHist", collHist);
   if (state.view === "coll") renderColl();
 }
-function collChartHtml(total) {
+function collChartHtml(total, invested) {
   const h = collHist;
   if (!h.length) return `<p class="note" style="margin:0">Der Verlauf startet beim nächsten Öffnen der App.</p>`;
   const first = h[0].p, last = h[h.length - 1].p, ch = (last - first) / first * 100;
   const dir = h.length < 2 ? "none" : ch > 0.5 ? "up" : ch < -0.5 ? "down" : "flat";
   return `<div class="cv-head"><span class="dir ${dir === "up" ? "down" : dir === "down" ? "up" : dir}">${h.length < 2 ? "" : (ch >= 0 ? "▲ " : "▼ ") + pct(ch)}</span>
       <span class="meta">${h.length < 2 ? "Erster Messpunkt gespeichert. Ab dem nächsten Öffnen entsteht die Kurve." : `seit ${fmtDate(h[0].d)} · ${h.length} Messpunkte`}</span></div>
-    <div class="chartbox"><div class="tip" hidden></div>${chartSvg(h, null)}</div>
+    <div class="chartbox"><div class="tip" hidden></div>${chartSvg(h, num(invested) ? invested : null)}</div>
+    ${num(invested) ? `<p class="note" style="margin-top:4px">Gestrichelte Linie: dein Kaufpreis für die ganze Sammlung (${eur(invested)}).</p>` : ""}
     ${Math.abs(total - last) > 0.005 ? `<p class="note" style="margin-top:4px">Aktueller Wert nach deinen letzten Änderungen: ${eur(total)}. Er kommt beim nächsten Öffnen als Punkt dazu.</p>` : ""}`;
 }
 function renderColl() {
@@ -837,6 +838,11 @@ function renderColl() {
   const missing = coll.filter(e => unitValue(e) == null).length;
   const sorted = [...coll].sort((a, b) => entryValue(b) - entryValue(a));
   const best = [...coll].sort((a, b) => (unitValue(b) ?? 0) - (unitValue(a) ?? 0))[0];
+  // Gewinn/Verlust: nur Einträge mit Kaufpreis und aktuellem Wert
+  const bought = coll.filter(e => num(e.buyPrice) && unitValue(e) != null);
+  const invested = bought.reduce((s, e) => s + e.buyPrice * e.qty, 0);
+  const boughtNow = bought.reduce((s, e) => s + entryValue(e), 0);
+  const pl = boughtNow - invested;
   const dates = coll.map(e => e.priceDate).filter(Boolean).sort();
   const stand = dates.length ? new Date(dates[dates.length - 1]).toLocaleDateString("de-DE") : null;
 
@@ -847,7 +853,11 @@ function renderColl() {
       <div class="value">${total > 0 ? eur(total) : "–"}</div>
       <div class="sub">${count} Karten · ${unique} verschiedene${stand ? " · Preise Stand " + stand : ""}${missing ? ` · ${missing} ohne Preis` : ""}</div>
     </div>
-    <div class="panel"><h3>Wertentwicklung</h3>${collChartHtml(total)}</div>
+    ${bought.length ? `<div class="tiles">
+      <div class="panel tile"><p class="label">Investiert</p><div class="value">${eur(invested)}</div><div class="sub">${bought.length} von ${coll.length} Einträgen</div></div>
+      <div class="panel tile"><p class="label">Gewinn / Verlust</p><div class="value dir ${pl >= 0 ? "down" : "up"}" style="font-size:20px">${pl >= 0 ? "+" : "−"}${eur(Math.abs(pl)) === "–" ? "0,00 €" : eur(Math.abs(pl))}</div><div class="sub">${pct(invested ? pl / invested * 100 : 0)} seit Kauf</div></div>
+    </div>` : `<p class="note" style="margin:0">Tipp: Trag bei deinen Karten den Kaufpreis ein (Karte antippen), dann siehst du hier Gewinn und Verlust seit dem Kauf.</p>`}
+    <div class="panel"><h3>Wertentwicklung</h3>${collChartHtml(total, bought.length === coll.length ? invested : null)}</div>
     <div class="tiles">
       <div class="panel tile"><p class="label">Wertvollste Karte</p><div class="value">${eur(unitValue(best))}</div><div class="sub">${esc(best.name)}</div></div>
       <div class="panel tile"><p class="label">Ø pro Karte</p><div class="value">${eur(count ? total / count : 0)}</div><div class="sub">über alle Exemplare</div></div>
@@ -870,7 +880,8 @@ function renderColl() {
       <div class="mid"><div class="name">${esc(e.name)}</div>
         <div class="meta">${esc(e.set ?? "")} · ${esc(e.localId ?? "")}</div>
         <div class="chips"><span class="chip">${e.qty}×</span><span class="chip">${esc(LANGS[e.cardLang] ?? e.cardLang)}</span><span class="chip">${esc(e.cond)}</span>${e.variant === "holo" ? `<span class="chip">Holo</span>` : ""}${num(e.customPrice) ? `<span class="chip">eigener Preis</span>` : ""}</div></div>
-      <div class="right"><div class="total">${u ? eur(u * e.qty) : "–"}</div><div class="each">${u ? "je " + eur(u) : "kein Preis"}</div></div>`;
+      <div class="right"><div class="total">${u ? eur(u * e.qty) : "–"}</div><div class="each">${u ? "je " + eur(u) : "kein Preis"}</div>
+        ${u && num(e.buyPrice) ? `<div class="dir ${u >= e.buyPrice ? "down" : "up"}" style="font-size:12px">${u >= e.buyPrice ? "▲" : "▼"} ${pct((u - e.buyPrice) / e.buyPrice * 100)} seit Kauf</div>` : ""}</div>`;
     b.addEventListener("click", () => openEntrySheet(e.uid));
     list.appendChild(b);
   });
@@ -885,13 +896,17 @@ function formHtml(v, cm) {
       <label>Sprache<select id="f-lang">${opt(LANGS, v.cardLang)}</select></label>
       <label>Zustand<select id="f-cond">${opt(CONDS, v.cond, x => x.label)}</select></label>
       <label>Ausführung<select id="f-var">${opt(hasHolo || v.variant === "holo" ? VARIANTS : { normal: "Normal" }, v.variant)}</select></label>
+      <label>Kaufpreis pro Stück (€)<input id="f-buy" type="text" inputmode="decimal" placeholder="z. B. 49,90" value="${num(v.buyPrice) ? String(v.buyPrice).replace(".", ",") : ""}"></label>
+      <label>Kaufdatum<input id="f-buydate" type="date" value="${esc(v.buyDate || today())}"></label>
       <label style="grid-column:1/-1">Eigener Preis pro Stück (optional, €)<input id="f-price" type="text" inputmode="decimal" placeholder="leer = Schätzung" value="${num(v.customPrice) ? String(v.customPrice).replace(".", ",") : ""}"></label>
     </div>
     <div class="estimate" id="f-est"></div>`;
 }
+const parseEur = (v) => num(parseFloat(String(v || "").replace(/\s|€/g, "").replace(/\.(?=\d{3}(\D|$))/g, "").replace(",", ".")));
 function readForm() {
   const p = parseFloat(($("f-price").value || "").replace(/\./g, "").replace(",", "."));
   return {
+    buyPrice: parseEur($("f-buy").value), buyDate: $("f-buydate").value || today(),
     qty: Math.max(1, parseInt($("f-qty").value, 10) || 1),
     cardLang: $("f-lang").value, cond: $("f-cond").value, variant: $("f-var").value,
     customPrice: num(p)
@@ -902,12 +917,14 @@ function wireForm(cm) {
     const v = readForm();
     const e = { ...v, price: marketPrice(cm, v.variant) };
     const u = unitValue(e);
-    $("f-est").innerHTML = u ? `Wert: <strong>${eur(u * v.qty)}</strong> (${v.qty} × ${eur(u)}${num(v.customPrice) ? ", eigener Preis" : ""})` : "Für diese Karte gibt es keinen Marktpreis. Trag einen eigenen Preis ein, damit sie im Wert zählt.";
+    const pl = u && v.buyPrice ? (u - v.buyPrice) * v.qty : null;
+    $("f-est").innerHTML = (u ? `Wert: <strong>${eur(u * v.qty)}</strong> (${v.qty} × ${eur(u)}${num(v.customPrice) ? ", eigener Preis" : ""})` : "Für diese Karte gibt es keinen Marktpreis. Trag einen eigenen Preis ein, damit sie im Wert zählt.")
+      + (pl != null ? `<br>Seit Kauf: <span class="dir ${pl >= 0 ? "down" : "up"}">${pl >= 0 ? "+" : "−"}${eur(Math.abs(pl)) === "–" ? "0,00 €" : eur(Math.abs(pl))} (${pct((u - v.buyPrice) / v.buyPrice * 100)})</span>` : "");
   };
   $("sheet").querySelectorAll("[data-step]").forEach(b => b.onclick = () => {
     $("f-qty").value = Math.max(1, (parseInt($("f-qty").value, 10) || 1) + Number(b.dataset.step)); update();
   });
-  ["f-qty", "f-lang", "f-cond", "f-var", "f-price"].forEach(id => $(id).addEventListener("input", update));
+  ["f-qty", "f-lang", "f-cond", "f-var", "f-price", "f-buy"].forEach(id => $(id).addEventListener("input", update));
   update();
 }
 
@@ -971,7 +988,7 @@ async function openCardSheet(id, lang, preferLang) {
   wireForm(cm);
   $("add").onclick = () => {
     const v = readForm();
-    const same = coll.find(e => e.id === c.id && e.cardLang === v.cardLang && e.cond === v.cond && e.variant === v.variant && (e.customPrice ?? null) === (v.customPrice ?? null));
+    const same = coll.find(e => e.id === c.id && e.cardLang === v.cardLang && e.cond === v.cond && e.variant === v.variant && (e.customPrice ?? null) === (v.customPrice ?? null) && (e.buyPrice ?? null) === (v.buyPrice ?? null));
     if (same) same.qty += v.qty;
     else coll.push({ uid: Date.now().toString(36) + Math.random().toString(36).slice(2, 6), id: c.id, dataLang: lang, name: c.name, image: c.image, localId: c.localId, set: c.set?.name, ...v, price: marketPrice(cm, v.variant), priceDate: cm?.updated ?? null });
     saveColl(); closeSheet();
@@ -1009,7 +1026,8 @@ async function openEntrySheet(uid) {
     <div class="row">
       <img alt="${esc(e.name)}" src="${esc(img(e.image, "high"))}" style="width:30%">
       <div><h2>${esc(e.name)}</h2><div class="meta">${esc(e.set ?? "")} · Nr. ${esc(e.localId)}</div>
-      <div class="meta">Marktpreis (Trend): ${eur(e.price)}</div></div>
+      <div class="meta">Marktpreis (Trend): ${eur(e.price)}</div>
+      ${num(e.buyPrice) ? `<div class="meta">Gekauft${e.buyDate ? " am " + new Date(e.buyDate + "T12:00:00").toLocaleDateString("de-DE") : ""} für ${eur(e.buyPrice)} je Stück</div>` : ""}</div>
     </div>
     <fieldset class="add"><legend>Eintrag bearbeiten</legend>${formHtml(e, cm)}
       <button class="btn" id="upd">Speichern</button>
