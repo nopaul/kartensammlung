@@ -341,10 +341,11 @@ async function parseQuery(q, lang) {
   const SUFFIX = ["ex", "gx", "v", "vmax", "vstar", "lv", "break", "prime", "star", "delta", "mega", "tag", "team", "legend"];
   if (tok && tok.length <= 8 && !SUFFIX.includes(norm(tok))) {
     // erst in der eingestellten Sprache suchen, dann in der anderen (neue Sets gibt es oft zuerst nur auf Englisch)
-    for (const l of [lang, lang === "de" ? "en" : "de"]) {
-      set = await findSet(tok, l, false);
-      if (!set && tok.length <= 5) set = await findSet(tok, l, true);
-      if (set) { setLang = l; break; }
+    // zuerst schnelle Prüfung (Set-ID, Anfangsbuchstaben) in beiden Sprachen, erst dann die offiziellen Kürzel laden
+    const langs = [lang, lang === "de" ? "en" : "de"];
+    for (const deep of [false, true]) {
+      if (set || (deep && tok.length > 5)) break;
+      for (const l of langs) { set = await findSet(tok, l, deep); if (set) { setLang = l; break; } }
     }
     if (set) parts.pop();
   }
@@ -381,40 +382,53 @@ function mergeById(primary, secondary) {
 async function nameSearch(q) {
   const L = state.lang, O = OTHER(L);
   const enc = encodeURIComponent(q);
-  // 1) Name in beiden Datenbanken suchen (für Namen wie „Pikachu“, die in beiden Sprachen gleich sind)
+  // 1) Name in beiden Datenbanken suchen (für Namen wie „Pikachu“ oder „Zubat“, die in beiden Sprachen gleich sind)
   const [a, b] = await Promise.all([
     fetchPages(`${API}/${L}/cards?name=${enc}`).catch(() => null),
     fetchPages(`${API}/${O}/cards?name=${enc}`).catch(() => [])
   ]);
   if (a === null) throw new Error("api");
   let list = mergeById(a.map(c => ({ ...c, lang: L })), b.map(c => ({ ...c, lang: O })));
-  // 2) Übersetzen über die Pokédex-Nummer: Treffer der einen Sprache finden dieselben Pokémon in der anderen,
-  //    so fehlen keine Karten, die es nur in einer Sprachdatenbank gibt
-  const seeds = list.slice(0, 8);
-  const dex = new Set();
-  await Promise.all(seeds.map(async c => { const f = await getCard(c.id, c.lang); (f?.dexId || []).forEach(d => dex.add(d)); }));
-  if (dex.size && dex.size <= 3) {
-    const extra = await Promise.all([...dex].flatMap(d => [L, O].map(async l => {
-      const r = await fetchPages(`${API}/${l}/cards?dexId=eq:${d}`).catch(() => []);
-      // Sicherheitsprüfung: Stichprobe muss wirklich diese Pokédex-Nummer haben, sonst Ergebnis verwerfen
-      const probe = await Promise.all(r.slice(0, 2).map(c => getCard(c.id, l)));
-      if (!r.length || probe.some(f => !(f?.dexId || []).includes(d))) return [];
-      return r.map(c => ({ ...c, lang: l }));
-    })));
-    // nur Karten übernehmen, deren Name zum Suchbegriff passt (z. B. „Glurak ex“ soll kein „Glurak VMAX“ liefern)
-    const words = q.toLowerCase().split(/[\s\-]+/).slice(1).map(norm).filter(Boolean);
-    const fit = (c) => !words.length || words.every(w => norm(c.name).includes(w));
-    const all = extra.flat().filter(fit);
-    const pri = all.filter(c => c.lang === L), sec = all.filter(c => c.lang === O);
-    list = mergeById(mergeById(list.filter(c => c.lang === L), pri), mergeById(list.filter(c => c.lang === O), sec));
+  // Schreibweisen angleichen: „Glurak ex“ soll auch „Glurak-ex“ finden. Dazu nach dem ersten Wort suchen und lokal filtern.
+  const first = q.split(/[\s\-]+/)[0];
+  if (first && first !== q) {
+    const nq = norm(q);
+    const [c2, d2] = await Promise.all([L, O].map(l => fetchPages(`${API}/${l}/cards?name=${encodeURIComponent(first)}`).then(r => r.filter(c => norm(c.name).includes(nq)).map(c => ({ ...c, lang: l }))).catch(() => [])));
+    list = mergeById(mergeById(list.filter(c => c.lang === L), c2), mergeById(list.filter(c => c.lang === O), d2));
   }
-  return list;
+  // 2) Übersetzen: Name derselben Karte in der anderen Sprache nachschlagen („Glurak-ex“ -> „Charizard ex“ -> „Charizard“)
+  //    und damit in beiden Datenbanken weitersuchen. So fehlen keine Karten, die es nur in einer Sprache gibt.
+  const words = extraWords(q);
+  const bases = new Map(); // Sprache -> Set von Grundnamen
+  await Promise.all(list.slice(0, 6).map(async c => {
+    for (const l of [L, O]) {
+      const f = l === c.lang ? await getCard(c.id, l) : await getCard(c.id, l);
+      const base = baseName(f?.name);
+      if (base && norm(base) !== norm(q)) { if (!bases.has(l)) bases.set(l, new Set()); bases.get(l).add(base); }
+    }
+  }));
+  const extra = await Promise.all([...bases].flatMap(([l, set]) => [...set].slice(0, 2).map(nm =>
+    fetchPages(`${API}/${l}/cards?name=${encodeURIComponent(nm)}`).then(r => r.map(c => ({ ...c, lang: l }))).catch(() => [])
+  )));
+  const fit = (c) => !words.length || words.every(w => norm(c.name).includes(w));
+  const all = extra.flat().filter(fit);
+  return mergeById(mergeById(list.filter(c => c.lang === L), all.filter(c => c.lang === L)), mergeById(list.filter(c => c.lang === O), all.filter(c => c.lang === O)));
 }
+// Grundname eines Pokémon ohne Zusätze: „Mega Charizard X ex“ -> „Charizard“, „Glurak-ex“ -> „Glurak“
+const NAME_EXTRAS = new Set(["ex", "gx", "v", "vmax", "vstar", "break", "prime", "legend", "lv", "lvx", "mega", "m", "x", "y", "radiant", "strahlendes", "strahlender", "strahlende", "dark", "light", "shining", "star", "delta", "team", "rockets", "tag", "team", "and", "&", "δ", "◇", "☆"]);
+function baseName(n) {
+  if (!n) return "";
+  const toks = String(n).replace(/[-’']s?\b/g, " ").split(/[\s\-]+/).filter(t => t && !NAME_EXTRAS.has(norm(t)) && norm(t).length > 1);
+  return toks[0] || "";
+}
+const extraWords = (q) => String(q).toLowerCase().split(/[\s\-]+/).slice(1).map(norm).filter(w => w && w.length > 0);
 async function setCards(setId) {
   const L = state.lang, O = OTHER(L);
   const [a, b] = await Promise.all([cardsOfSet(setId, L), cardsOfSet(setId, O)]);
   if (!a && !b) return null;
-  return mergeById((a?.cards || []).map(c => ({ ...c, lang: L })), (b?.cards || []).map(c => ({ ...c, lang: O })));
+  const cards = mergeById((a?.cards || []).map(c => ({ ...c, lang: L })), (b?.cards || []).map(c => ({ ...c, lang: O })));
+  const total = Math.max(a?.cardCount?.total || 0, b?.cardCount?.total || 0, a?.cardCount?.official || 0, b?.cardCount?.official || 0);
+  return Object.assign(cards, { total });
 }
 
 // Seltenheit als Rangzahl (deutsch und englisch), höher = seltener
@@ -450,39 +464,45 @@ async function search(q) {
       const pq = await parseQuery(q, state.lang);
       if (pq.set) { set = pq.set; name = pq.name; number = pq.number; }
     }
+    let coverage = "";
     if (set) {
       const cards = await setCards(set.id);
       if (!cards) throw new Error("set");
-      const n = norm(name);
-      // Name auch sprachübergreifend erkennen: Karten-IDs aus der normalen Suche (z. B. „Glurak“ findet „Charizard“)
-      const ids = n ? new Set((await nameSearch(name).catch(() => [])).map(c => c.id)) : null;
-      list = cards.filter(c => (!n || norm(c.name).includes(n) || ids.has(c.id)) && (!number || String(c.localId).replace(/^0+/, "").toLowerCase() === number.replace(/^0+/, "").toLowerCase()));
-      if (!list.length && !setId) { set = null; list = await nameSearch(q); }
-    } else list = await nameSearch(q);
-    list = list.filter(c => c.image);
-    if (state.token !== token) return;
-    label = set ? `${name ? "„" + name + "“ im Set " : "Set "}${set.name}${number ? ", Nr. " + number : ""}` : `„${q}“`;
-    if (!list.length) { status.textContent = `Keine Karten zu ${label} gefunden. Prüfe die Schreibweise.`; return; }
-    if (set) {
-      // nach Seltenheit sortieren: dafür die Details aller Karten laden
-      let done = 0;
-      status.textContent = `${list.length} Karten in ${set.name}. Sortiere nach Seltenheit… 0/${list.length}`;
-      let i = 0;
-      const full = new Array(list.length);
+      if (cards.total && cards.length < cards.total) coverage = ` Hinweis: Die Kartendatenbank enthält von diesem Set bisher erst ${cards.length} von ${cards.total} Karten.`;
+      // Details aller Setkarten laden: für die Seltenheit und um Namen sprachübergreifend über die Pokédex-Nummer zu erkennen
+      let done = 0, i = 0;
+      const full = new Array(cards.length);
+      status.textContent = `Lade ${cards.length} Karten aus ${set.name}… 0/${cards.length}`;
       async function worker() {
-        while (i < list.length) {
+        while (i < cards.length) {
           const k = i++;
-          full[k] = await getCard(list[k].id, list[k].lang);
+          full[k] = await getCard(cards[k].id, cards[k].lang);
           done++;
-          if (state.token === token && done % 10 === 0) status.textContent = `${list.length} Karten in ${set.name}. Sortiere nach Seltenheit… ${done}/${list.length}`;
+          if (state.token === token && done % 10 === 0) status.textContent = `Lade ${cards.length} Karten aus ${set.name}… ${done}/${cards.length}`;
         }
       }
       await Promise.all(Array.from({ length: 10 }, worker));
       if (state.token !== token) return;
-      list = list.map((c, k) => ({ ...c, rarity: full[k]?.rarity, rank: rarityRank(full[k]?.rarity) }))
+      const n = norm(name);
+      let ids = new Set(), qDex = new Set();
+      if (n) {
+        const hits = await nameSearch(name).catch(() => []);
+        ids = new Set(hits.map(c => c.id));
+        await Promise.all(hits.slice(0, 6).map(async c => ((await getCard(c.id, c.lang))?.dexId || []).forEach(d => qDex.add(d))));
+      }
+      const words = extraWords(name);
+      const numOk = (c) => !number || String(c.localId).replace(/^0+/, "").toLowerCase() === number.replace(/^0+/, "").toLowerCase();
+      list = cards.map((c, k) => ({ ...c, rarity: full[k]?.rarity, rank: rarityRank(full[k]?.rarity), dex: full[k]?.dexId || [] }))
+        .filter(c => numOk(c) && (!n || norm(c.name).includes(n) || ids.has(c.id) ||
+          (c.dex.some(d => qDex.has(d)) && words.every(w => norm(c.name).includes(w)))))
+        .filter(c => c.image)
         .sort((x, y) => y.rank - x.rank || localNum(y.localId) - localNum(x.localId));
-    }
-    status.textContent = `${list.length} Karten zu ${label}${set ? ", seltenste zuerst" : ""}. Preise von Cardmarket.`;
+      if (!list.length && !setId) { coverage = coverage || ""; const fb = (await nameSearch(q).catch(() => [])).filter(c => c.image); if (fb.length) { set = null; list = fb; } }
+    } else list = (await nameSearch(q)).filter(c => c.image);
+    if (state.token !== token) return;
+    label = set ? `${name ? "„" + name + "“ im Set " : "Set "}${set.name}${number ? ", Nr. " + number : ""}` : `„${q}“`;
+    if (!list.length) { status.textContent = `Keine Karten zu ${label} gefunden. Prüfe die Schreibweise.${coverage}`; return; }
+    status.textContent = `${list.length} Karten zu ${label}${set ? ", seltenste zuerst" : ""}. Preise von Cardmarket.${coverage}`;
     state.results = list; state.shown = 0;
     $("view").replaceChildren();
     showMore();
